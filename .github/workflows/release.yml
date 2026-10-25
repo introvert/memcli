@@ -1,0 +1,50 @@
+name: release
+
+# Push a tag like v0.1.0 to build binaries for every platform and publish a GitHub Release.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Test
+        run: go vet ./...
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0" # pure-Go SQLite, so every target cross-compiles from here
+        run: |
+          set -eu
+          mkdir -p dist
+          for target in darwin/arm64 darwin/amd64 linux/amd64 linux/arm64 windows/amd64 windows/arm64; do
+            os=${target%/*} arch=${target#*/}
+            name=mem_${os}_${arch}
+            ext=""; [ "$os" = windows ] && ext=.exe
+            mkdir -p "build/$name"
+            GOOS=$os GOARCH=$arch go build -trimpath \
+              -ldflags "-s -w -X main.version=${GITHUB_REF_NAME}" \
+              -o "build/$name/mem$ext" ./cmd/mem
+            cp README.md "build/$name/"
+            if [ "$os" = windows ]; then
+              (cd build/$name && zip -q "../../dist/$name.zip" ./*)
+            else
+              tar -czf "dist/$name.tar.gz" -C "build/$name" .
+            fi
+          done
+          (cd dist && sha256sum ./* | sed 's| \./| |') > checksums.txt && mv checksums.txt dist/
+          cat dist/checksums.txt
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --title "$GITHUB_REF_NAME" --generate-notes

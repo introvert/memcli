@@ -37,6 +37,8 @@ Flags: --json (s/ls/show/ask) machine-readable output · -m provider/model (ask/
 Storage: $MEM_HOME (default ~/.mem). If it is a git repo, every change is auto-committed.
 Models: deepseek/deepseek-flash (default), anthropic/claude-opus-5-5, openai/<m>, gemini/<m>, ollama/<m>, openrouter/<m>, groq/<m>, ...`
 
+var version = "dev" // set at release build time: -ldflags "-X main.version=v1.2.3"
+
 var color = isTTY(os.Stdout) && os.Getenv("NO_COLOR") == ""
 
 func main() {
@@ -58,6 +60,8 @@ func main() {
 	switch args[0] {
 	case "-h", "--help", "help":
 		fmt.Println(usage)
+	case "-v", "--version", "version":
+		fmt.Println("mem " + version)
 	default:
 		if f, ok := cmds[args[0]]; ok {
 			f(args[1:])

@@ -17,13 +17,30 @@ sources:
 
 ## Install
 
+macOS / Linux, no Go needed:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/introvert/memcli/main/install.sh | sh
+```
+
+It downloads the right binary from [Releases](https://github.com/introvert/memcli/releases),
+verifies its SHA-256 checksum, and installs to `~/.local/bin`
+(`MEM_INSTALL_DIR=...` to change, `MEM_VERSION=v0.1.0` to pin). Run it again to update.
+Windows: download the `.zip` from Releases.
+
+With Go:
+
 ```sh
 go install github.com/introvert/memcli/cmd/mem@latest
-# or from a checkout
-go build -ldflags="-s -w" -o mem ./cmd/mem && cp mem ~/.local/bin/
-
-git init ~/.mem    # optional: version history + sync for your notes
 ```
+
+Optional: `git init ~/.mem` to get version history (and sync) for your notes.
+
+### Releasing
+
+Push a tag — `git tag v0.1.0 && git push origin v0.1.0` — and the
+[release workflow](.github/workflows/release.yml) builds macOS, Linux and Windows binaries
+(amd64 + arm64) and publishes them with checksums.
 
 ## Usage
 
