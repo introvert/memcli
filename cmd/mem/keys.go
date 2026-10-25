@@ -33,8 +33,23 @@ func envOr(k, def string) string {
 	return def
 }
 
+type keyResult struct{ key, source string }
+
+var keyCache = map[string]keyResult{} // one keychain lookup per provider per run
+
 // apiKey finds the key for a provider; source says where it came from ("" = not found).
 func apiKey(p Provider) (key, source string, err error) {
+	if r, ok := keyCache[p.Name]; ok {
+		return r.key, r.source, nil
+	}
+	key, source, err = lookupKey(p)
+	if err == nil {
+		keyCache[p.Name] = keyResult{key, source}
+	}
+	return key, source, err
+}
+
+func lookupKey(p Provider) (key, source string, err error) {
 	if p.APIKeyEnv != "" {
 		if v := os.Getenv(p.APIKeyEnv); v != "" {
 			return v, "env " + p.APIKeyEnv, nil

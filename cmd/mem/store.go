@@ -39,6 +39,7 @@ type Note struct {
 	Title   string   `json:"title"`
 	Body    string   `json:"body"`
 	Path    string   `json:"path,omitempty"`
+	Private bool     `json:"private,omitempty"` // hidden from AI (frontmatter or ai_exclude)
 }
 
 // ---------- files (source of truth) ----------
@@ -99,10 +100,62 @@ func parseNote(path string) (Note, error) {
 			created = st.ModTime().Format("2006-01-02T15:04:05")
 		}
 	}
+	id := noteID(path)
 	return Note{
-		ID: noteID(path), Created: strings.Trim(created, `"'`),
+		ID: id, Created: strings.Trim(created, `"'`),
 		Tags: sortedKeys(tags), Title: titleOf(body, path), Body: body, Path: path,
+		Private: isTrue(meta["private"]) || strings.EqualFold(meta["ai"], "false") || aiExcluded(id),
 	}, nil
+}
+
+func isTrue(v string) bool {
+	v = strings.ToLower(strings.Trim(v, `"' `))
+	return v == "true" || v == "yes" || v == "1"
+}
+
+// aiExcluded reports whether a note id matches the config's ai_exclude patterns:
+// "Kundix/Crypto" (a folder or note), "**/secrets*", "Kundix/*/keys" (* = within a folder, ** = any depth).
+func aiExcluded(id string) bool {
+	for _, re := range aiExcludeRes() {
+		if re.MatchString(id) {
+			return true
+		}
+	}
+	return false
+}
+
+var aiExcludeCache []*regexp.Regexp
+
+func aiExcludeRes() []*regexp.Regexp {
+	if aiExcludeCache == nil {
+		aiExcludeCache = []*regexp.Regexp{}
+		for _, g := range loadConfig().AIExclude {
+			g = strings.Trim(strings.TrimSuffix(strings.TrimSpace(g), ".md"), "/")
+			if g == "" {
+				continue
+			}
+			var b strings.Builder
+			for i := 0; i < len(g); i++ {
+				switch {
+				case strings.HasPrefix(g[i:], "**/"):
+					b.WriteString("(?:.*/)?")
+					i += 2
+				case strings.HasPrefix(g[i:], "**"):
+					b.WriteString(".*")
+					i++
+				case g[i] == '*':
+					b.WriteString("[^/]*")
+				case g[i] == '?':
+					b.WriteString("[^/]")
+				default:
+					b.WriteString(regexp.QuoteMeta(g[i : i+1]))
+				}
+			}
+			// A pattern matches the note itself or anything under it (folders).
+			aiExcludeCache = append(aiExcludeCache, regexp.MustCompile("(?i)^"+b.String()+"(?:/.*)?$"))
+		}
+	}
+	return aiExcludeCache
 }
 
 func splitFrontmatter(text string) (fm, rest string, ok bool) {
@@ -270,6 +323,7 @@ func openIndex() (*sql.DB, error) {
 	_, err = db.Exec(`
 		CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 		CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, mtime INTEGER);
+		CREATE TABLE IF NOT EXISTS private(id TEXT PRIMARY KEY); -- notes hidden from AI
 		CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
 			id UNINDEXED, created UNINDEXED, title, body, tags,
 			tokenize = 'porter unicode61 remove_diacritics 2');`)
@@ -280,9 +334,11 @@ func openIndex() (*sql.DB, error) {
 	var dir string
 	db.QueryRow("SELECT v FROM meta WHERE k='notes_dir'").Scan(&dir)
 	// Same for the redaction rules: the index only ever holds redacted text.
-	want := notesD + "|" + redactVersion + "|" + strings.Join(loadConfig().RedactPatterns, "\x00")
+	// And for ai_exclude, which decides the private table.
+	cfg := loadConfig()
+	want := notesD + "|" + redactVersion + "|" + strings.Join(cfg.RedactPatterns, "\x00") + "|" + strings.Join(cfg.AIExclude, "\x00")
 	if dir != want {
-		db.Exec("DELETE FROM files; DELETE FROM fts;")
+		db.Exec("DELETE FROM files; DELETE FROM fts; DELETE FROM private;")
 		db.Exec("INSERT OR REPLACE INTO meta VALUES('notes_dir', ?)", want)
 	}
 	return db, syncIndex(db)
@@ -332,6 +388,7 @@ func syncIndex(db *sql.DB) error {
 		if _, ok := onDisk[id]; !ok {
 			tx.Exec("DELETE FROM files WHERE id=?", id)
 			tx.Exec("DELETE FROM fts WHERE id=?", id)
+			tx.Exec("DELETE FROM private WHERE id=?", id)
 		}
 	}
 	for id, p := range onDisk {
@@ -351,6 +408,11 @@ func syncIndex(db *sql.DB) error {
 		tx.Exec("DELETE FROM fts WHERE id=?", id)
 		tx.Exec("INSERT INTO fts VALUES(?,?,?,?,?)", id, n.Created, titleOf(body, p), body, strings.Join(n.Tags, " "))
 		tx.Exec("INSERT OR REPLACE INTO files VALUES(?,?)", id, mt)
+		if n.Private {
+			tx.Exec("INSERT OR IGNORE INTO private VALUES(?)", id)
+		} else {
+			tx.Exec("DELETE FROM private WHERE id=?", id)
+		}
 	}
 	return tx.Commit()
 }
@@ -374,10 +436,20 @@ type Hit struct {
 	Snippet string `json:"-"`
 }
 
-func search(db *sql.DB, match string, limit int, hlOn, hlOff string) ([]Hit, error) {
+// notPrivate is appended to queries that feed the AI: private notes don't exist for it.
+const notPrivate = " AND id NOT IN (SELECT id FROM private)"
+
+func aiFilter(ai bool) string {
+	if ai {
+		return notPrivate
+	}
+	return ""
+}
+
+func search(db *sql.DB, match string, limit int, hlOn, hlOff string, ai bool) ([]Hit, error) {
 	rows, err := db.Query(`
 		SELECT id, created, title, tags, snippet(fts, 3, ?, ?, '…', 14), body
-		FROM fts WHERE fts MATCH ?
+		FROM fts WHERE fts MATCH ?`+aiFilter(ai)+`
 		ORDER BY bm25(fts, 0, 0, 5.0, 1.0, 3.0) LIMIT ?`, hlOn, hlOff, match, limit)
 	if err != nil {
 		return nil, err
@@ -385,10 +457,10 @@ func search(db *sql.DB, match string, limit int, hlOn, hlOff string) ([]Hit, err
 	return scanHits(rows)
 }
 
-func recent(db *sql.DB, tag string, limit int) ([]Hit, error) {
-	q, args := "SELECT id, created, title, tags, '', body FROM fts", []any{}
+func recent(db *sql.DB, tag string, limit int, ai bool) ([]Hit, error) {
+	q, args := "SELECT id, created, title, tags, '', body FROM fts WHERE 1=1"+aiFilter(ai), []any{}
 	if tag != "" {
-		q += " WHERE fts MATCH ?"
+		q += " AND fts MATCH ?"
 		args = append(args, tagQuery(tag))
 	}
 	rows, err := db.Query(q+" ORDER BY "+idOrder("DESC")+" LIMIT ?", append(args, limit)...)
@@ -400,10 +472,10 @@ func recent(db *sql.DB, tag string, limit int) ([]Hit, error) {
 
 // allNotes returns every note (optionally one tag), oldest first, and their total size.
 // Oldest-first keeps the prompt prefix stable as notes are added, so provider caching works.
-func allNotes(db *sql.DB, tag string) ([]Hit, int, error) {
-	q, args := "SELECT id, created, title, tags, '', body FROM fts", []any{}
+func allNotes(db *sql.DB, tag string, ai bool) ([]Hit, int, error) {
+	q, args := "SELECT id, created, title, tags, '', body FROM fts WHERE 1=1"+aiFilter(ai), []any{}
 	if tag != "" {
-		q += " WHERE fts MATCH ?"
+		q += " AND fts MATCH ?"
 		args = append(args, tagQuery(tag))
 	}
 	rows, err := db.Query(q+" ORDER BY "+idOrder("ASC"), args...)
@@ -436,8 +508,13 @@ func scanHits(rows *sql.Rows) ([]Hit, error) {
 	return out, rows.Err()
 }
 
-func tagCounts(db *sql.DB) (map[string]int, error) {
-	rows, err := db.Query("SELECT tags FROM fts")
+func isPrivate(db *sql.DB, id string) bool {
+	var x string
+	return db.QueryRow("SELECT id FROM private WHERE id=?", id).Scan(&x) == nil
+}
+
+func tagCounts(db *sql.DB, ai bool) (map[string]int, error) {
+	rows, err := db.Query("SELECT tags FROM fts WHERE 1=1" + aiFilter(ai))
 	if err != nil {
 		return nil, err
 	}

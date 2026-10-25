@@ -15,7 +15,7 @@ import (
 // `mem show` / `mem edit` read the files directly and are never redacted.
 
 // Bump when the rules change: the index is rebuilt with the new rules.
-const redactVersion = "5"
+const redactVersion = "6"
 
 //go:embed bip39.txt
 var bip39Raw string
@@ -65,14 +65,19 @@ var rules = []rule{
 type Finding struct {
 	Kind, Preview string
 	Line          int
+	Value         string // the secret itself: only ever used locally (copy/run), never printed or sent
 }
 
-// redact returns text with secrets replaced by [REDACTED:kind], plus what it found.
+// placeholderRe matches what redact leaves behind: [REDACTED:kind#n], n = nth secret in the note.
+var placeholderRe = regexp.MustCompile(`\[REDACTED:([a-z-]+)#(\d+)\]`)
+
+// redact returns text with secrets replaced by numbered placeholders, plus what it found
+// (findings[n-1] is placeholder #n).
 func redact(text string, extra []*regexp.Regexp) (string, []Finding) {
 	var found []Finding
-	mark := func(kind, secret string, at int) string {
-		found = append(found, Finding{Kind: kind, Preview: mask(secret), Line: 1 + strings.Count(text[:at], "\n")})
-		return "[REDACTED:" + kind + "]"
+	mark := func(kind, secret string, at, n int) string {
+		found = append(found, Finding{Kind: kind, Preview: mask(secret), Line: 1 + strings.Count(text[:at], "\n"), Value: secret})
+		return fmt.Sprintf("[REDACTED:%s#%d]", kind, n)
 	}
 	// Collect spans on the original text, then replace right-to-left so offsets stay valid.
 	var spans []span
@@ -114,7 +119,7 @@ func redact(text string, extra []*regexp.Regexp) (string, []Finding) {
 	out := text
 	for i := len(merged) - 1; i >= 0; i-- {
 		s := merged[i]
-		out = out[:s.start] + mark(s.kind, text[s.start:s.end], s.start) + out[s.end:]
+		out = out[:s.start] + mark(s.kind, text[s.start:s.end], s.start, i+1) + out[s.end:]
 	}
 	// found was filled right-to-left
 	for i, j := 0, len(found)-1; i < j; i, j = i+1, j-1 {

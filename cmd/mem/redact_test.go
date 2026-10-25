@@ -46,7 +46,7 @@ func TestRedactCatches(t *testing.T) {
 		if len(found) == 0 {
 			t.Errorf("%s: no finding reported", c.name)
 		}
-		if c.kind != "" && !strings.Contains(out, "[REDACTED:"+c.kind+"]") {
+		if c.kind != "" && !strings.Contains(out, "[REDACTED:"+c.kind+"#") {
 			t.Errorf("%s: want kind %s, got %q", c.name, c.kind, out)
 		}
 	}
@@ -86,5 +86,10 @@ func TestRedactExtraPatternsAndLines(t *testing.T) {
 	}
 	if again, f2 := redact(out, nil); again != out || len(f2) != 0 {
 		t.Fatalf("redaction not idempotent: %q / %+v", again, f2)
+	}
+	// Placeholders are numbered in document order and map back to the original values.
+	if !strings.Contains(out, "[REDACTED:custom#1]") || !strings.Contains(out, "[REDACTED:secret#2]") ||
+		found[0].Value != "PIN-CODE 99887766" || found[1].Value != "abcdef" {
+		t.Fatalf("numbering/values wrong: %q %+v", out, found)
 	}
 }

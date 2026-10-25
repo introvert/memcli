@@ -64,6 +64,7 @@ mem add -a "..."                add and let AI pick tags
 mem s oat milk [-t todo]        search (ranked, prefix-matching)
 mem ask "question"              AI agent searches your notes and answers, citing sources
 mem ask -d "question"           same, with deep thinking for hard questions (slower)
+                                after an answer: 1-9 copy/run · a copy answer · o open note · f follow-up
 mem key set deepseek            store an API key in the OS keychain (mem key ls / rm)
 mem secrets                     what the privacy filter hides from AI (values masked)
 mem ls [-n 20] [-t todo]        recent notes
@@ -101,10 +102,29 @@ can use the same memory. `-m provider/model` picks a model for one run.
   strings, then reads the notes it needs. Each step is shown as it runs; it answers within
   `max_steps` rounds and cites the notes it used. Only what the tools return is sent, never the
   whole folder.
+- **Act on the answer.** In a terminal, a one-key menu follows each answer, built from what it
+  contains: copy a value (hosts, IDs, URLs in backticks), copy a secret, run a command, open the
+  cited note, or ask a follow-up in the same conversation:
+
+  ```
+    1  copy  pg-staging.internal
+    2  copy  password from Infra/staging-db  (never shown; clipboard clears in 45s)
+    3  run   psql "postgres://app_ro:•••(password)@pg-staging.internal/app"
+    1-3 · a copy answer · o open Infra/staging-db · f follow-up · ⏎ done
+  ```
+
+  Secrets work without the model ever seeing them: it only gets placeholders like
+  `[REDACTED:password#2]` and may use them in commands; mem fills in the real value locally when you
+  copy or run. Commands are shown (secrets masked) and run only after you press `y`. `-q` or
+  `"actions": false` turns the menu off; it never appears when output is piped or with `--json`.
+- **Keep notes away from AI entirely** with `"ai_exclude": ["Kundix/Crypto", "**/keys*"]` or
+  `private: true` in a note's frontmatter. Those notes don't exist for `ask` (search, grep, list,
+  read, prefetch, tags) but stay fully usable locally with `mem s`, `show` and `edit`.
 - **It's fast.** Before the first model call, mem runs the obvious search locally (milliseconds)
   and sends the top matches plus the full text of the best notes, so most questions are answered
-  in one call; tools are only used when that isn't enough. Thinking is off by default (note lookups
-  don't need it) and the answer streams as it is written. `mem ask -d` turns deep thinking on.
+  in one call; tools are only used when that isn't enough. The API connection is opened while that
+  search runs, thinking is off by default (note lookups don't need it), and the answer streams as it
+  is written. `mem ask -d` turns deep thinking on.
 - **Secrets never leave your machine.** Everything the model sees passes through a redaction
   filter: known token formats (AWS, GitHub, GitLab, Slack, Stripe, OpenAI/Anthropic/DeepSeek-style
   `sk-…`, Google, JWT, SendGrid, npm/PyPI/Hugging Face, Telegram), private-key blocks, passwords in
@@ -146,6 +166,8 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
   "fast_model": "",
   "auto_tag": false,
   "max_steps": 8,
+  "ai_exclude": ["Kundix/Crypto"],
+  "actions": true,
   "redact_patterns": ["INTERNAL-\\d{6}"],
   "providers": {
     "my-server": { "api": "openai", "base_url": "http://localhost:8080/v1", "api_key_env": "MY_KEY" },

@@ -25,6 +25,8 @@ const usage = `mem — tiny personal memory
   mem s oat milk [-t todo]        search (ranked, prefix-matching)
   mem ask "when does the pg password rotate?"   AI agent searches your notes and answers, citing sources
   mem ask -d "..."                same, with deep thinking for hard questions (slower)
+                                  after an answer: 1-9 copy/run · a copy answer · o open note · f follow-up
+                                  (-q: no menu)
   mem secrets                     what the privacy filter hides from AI (values masked)
   mem key set deepseek            store an API key in the OS keychain (mem key ls / rm)
   mem ls [-n 20] [-t todo]        recent notes
@@ -58,7 +60,7 @@ func main() {
 	cmds := map[string]func([]string){
 		"add": cmdAdd, "s": cmdSearch, "search": cmdSearch, "ask": cmdAsk,
 		"ls": cmdLs, "show": cmdShow, "cat": cmdShow, "edit": cmdEdit, "rm": cmdRm,
-		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets, "key": cmdKey,
+		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets, "key": cmdKey, "__clipclear": cmdClipClear,
 		"path": func([]string) { fmt.Println(notesD) },
 	}
 	switch args[0] {
@@ -173,7 +175,7 @@ func cmdSearch(args []string) {
 	if color && !o.flags["--json"] {
 		on, off = "\x1b[1;33m", "\x1b[0m"
 	}
-	hits, err := search(db, strings.Join(parts, " AND "), o.limit(20), on, off)
+	hits, err := search(db, strings.Join(parts, " AND "), o.limit(20), on, off, false)
 	check(err)
 	if o.flags["--json"] {
 		printJSON(notesOf(hits))
@@ -192,12 +194,14 @@ func cmdSearch(args []string) {
 }
 
 func cmdAsk(args []string) {
-	o := parseOpts(args, "-d")
+	o := parseOpts(args, "-d", "-q")
 	question := strings.TrimSpace(strings.Join(o.pos, " "))
 	if question == "" {
-		die("usage: mem ask QUESTION [-d] [-t tag] [-m provider/model]")
+		die("usage: mem ask QUESTION [-d] [-q] [-t tag] [-m provider/model]")
 	}
 	cfg := loadConfig()
+	spec := pick(o, cfg.Model)
+	warmUp(cfg, spec) // connect to the API while we search locally
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 	db, err := openIndex()
@@ -212,7 +216,8 @@ func cmdAsk(args []string) {
 	if o.flags["--json"] {
 		progress, out = nil, nil
 	}
-	res, err := runAgent(ctx, db, cfg, pick(o, cfg.Model), question, o.kv["-t"], level, progress, out)
+	sess := newSession(db, cfg, spec, level, o.kv["-t"], progress)
+	res, err := sess.ask(ctx, question, out)
 	if out != nil {
 		fmt.Println()
 	}
@@ -221,11 +226,10 @@ func cmdAsk(args []string) {
 		printJSON(res)
 		return
 	}
-	if len(res.Sources) > 0 {
-		fmt.Println(c("2", "\nsources:"))
-		for _, n := range res.Sources {
-			fmt.Println(c("2", "  "+n.ID+"  "+strings.TrimSpace(tagRe.ReplaceAllString(n.Title, ""))))
-		}
+	printSources(res.Sources)
+	interactive := isTTY(os.Stdout) && isTTY(os.Stdin) && !o.flags["-q"] && (cfg.Actions == nil || *cfg.Actions)
+	if interactive {
+		actionMenu(sess, res)
 	}
 }
 
@@ -272,7 +276,7 @@ func cmdLs(args []string) {
 	o := parseOpts(args)
 	db, err := openIndex()
 	check(err)
-	hits, err := recent(db, o.kv["-t"], o.limit(20))
+	hits, err := recent(db, o.kv["-t"], o.limit(20), false)
 	check(err)
 	if o.flags["--json"] {
 		printJSON(notesOf(hits))
@@ -340,7 +344,7 @@ func cmdRm(args []string) {
 func cmdTags([]string) {
 	db, err := openIndex()
 	check(err)
-	counts, err := tagCounts(db)
+	counts, err := tagCounts(db, false)
 	check(err)
 	for _, t := range sortedByCount(counts) {
 		fmt.Printf("%5d  #%s\n", counts[t], t)
@@ -375,7 +379,7 @@ func cmdReindex([]string) {
 func suggestTags(cfg Config, spec, body string) ([]string, error) {
 	existing := ""
 	if db, err := openIndex(); err == nil {
-		if counts, err := tagCounts(db); err == nil {
+		if counts, err := tagCounts(db, true); err == nil { // the tag list goes to the model
 			top := sortedByCount(counts)
 			if len(top) > 60 {
 				top = top[:60]

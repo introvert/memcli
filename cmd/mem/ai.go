@@ -42,6 +42,8 @@ type Chat interface {
 	Next(ctx context.Context, allowTools bool, out io.Writer) (text string, calls []ToolCall, err error)
 	// AddResults appends the outputs of the calls from the last Next, in the same order.
 	AddResults(calls []ToolCall, results []string)
+	// AddUser appends a follow-up message from the user.
+	AddUser(text string)
 }
 
 func newChat(cfg Config, spec, system, user string, tools []Tool, level Level) (Chat, error) {
@@ -177,6 +179,10 @@ func (c *claudeChat) Next(ctx context.Context, allowTools bool, out io.Writer) (
 		}
 	}
 	return text.String(), calls, nil
+}
+
+func (c *claudeChat) AddUser(text string) {
+	c.params.Messages = append(c.params.Messages, anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(text)))
 }
 
 func (c *claudeChat) AddResults(calls []ToolCall, results []string) {
@@ -317,6 +323,10 @@ func (o *openaiChat) Next(ctx context.Context, allowTools bool, out io.Writer) (
 	}
 	o.msgs = append(o.msgs, msg)
 	return text.String(), calls, nil
+}
+
+func (o *openaiChat) AddUser(text string) {
+	o.msgs = append(o.msgs, map[string]any{"role": "user", "content": text})
 }
 
 func (o *openaiChat) AddResults(calls []ToolCall, results []string) {

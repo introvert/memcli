@@ -6,39 +6,43 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net/http"
 	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
 
 // `mem ask` runs a small agent: the model explores the notes with search/grep/list/read tools
 // and answers with citations. Every tool reads the index, whose note text is already redacted,
-// so secrets never reach the model and can't be probed by searching for guesses.
+// and skips private notes, so secrets and excluded notes never reach the model.
 
 const agentSystem = `You are mem, the user's personal-notes assistant. You answer questions from the user's
 notes, which you can only see through tools:
-- search: ranked full-text search (stemmed, prefix matching). Usually the best first step.
+- search: ranked full-text search (stemmed, prefix matching).
 - grep: exact text or regex over all notes; returns matching lines. Use for names, numbers, code, exact phrases.
 - list: browse folders, tags and the most recent notes.
 - read: read a note with line numbers.
 
 How to work:
-- Try a few phrasings: synonyms, related terms, and any other language the notes may be written in.
-- Read the most promising notes before answering; snippets alone can mislead.
-- Speed matters. The user's message already contains search results for the question, with the
-  best notes in full: if they answer it, answer right away without calling tools. Otherwise make
-  several independent lookups in the same turn, and stop as soon as you can answer.
+- Speed matters. Each user message already contains search results for it, with the best notes in
+  full: if they answer the question, answer right away without calling tools. Otherwise make several
+  independent lookups in the same turn (try synonyms, related terms, other languages the notes may be
+  written in), read the promising notes, and stop as soon as you can answer.
 - Don't write any text in a turn where you call tools; write only the final answer.
 
-Answer in the language of the question, concisely, in plain text for a terminal (no markdown headings).
+Answer in the language of the question, concisely, for a terminal (no markdown headings or tables).
 After each fact, cite the note id in square brackets exactly as the tools show it, e.g. [mem/261025-143012]
 or [Projects/ideas]. If the notes don't contain the answer, say so plainly instead of guessing.
+Put shell commands the user may run in a fenced block (` + "```sh" + `), one command per block, and values they
+may want to copy (hosts, IPs, IDs, URLs, names) in single backticks. The user can copy or run these.
 
-Privacy: values shown as [REDACTED:kind] were removed by the user's privacy filter before reaching you.
-Never guess or try to reconstruct them. If the user asks for one, name the note that holds it and tell them
-to run: mem show <id>`
+Privacy: secrets in notes are replaced by placeholders like [REDACTED:password#3] before you see them.
+Never guess or reconstruct a secret. When the user needs one, write its placeholder exactly as shown,
+also inside commands (e.g. psql "postgres://app:[REDACTED:password#3]@db/app"): the user's machine fills
+in the real value locally when they copy or run it, without it ever being shown to you.`
 
 var agentTools = []Tool{
 	{"search", "Ranked full-text search over all notes. Returns note ids, titles, tags, dates and a snippet.",
@@ -62,26 +66,106 @@ type askResult struct {
 	Steps   []string `json:"steps"`
 }
 
-func runAgent(ctx context.Context, db *sql.DB, cfg Config, spec, question, tag string, level Level, progress, out io.Writer) (askResult, error) {
-	user := fmt.Sprintf("Today is %s.\n\nQuestion: %s", time.Now().Format("2006-01-02 (Monday)"), question)
-	if tag != "" {
-		user += fmt.Sprintf("\n\n(The user is asking about notes tagged #%s.)", tag)
+// secretRef points a session placeholder back to the nth secret of a note.
+type secretRef struct {
+	Note string
+	N    int
+}
+
+// session is one `mem ask` conversation, follow-ups included.
+type session struct {
+	db       *sql.DB
+	cfg      Config
+	spec     string
+	level    Level
+	tag      string
+	chat     Chat
+	progress io.Writer
+	// Placeholders are numbered per note in the index ([REDACTED:password#2] = 2nd secret of that
+	// note). Before text reaches the model they are renumbered session-wide, so every placeholder
+	// the model sees maps to exactly one (note, n) — that's how copy/run fill in real values locally.
+	refs    []secretRef
+	refByID map[secretRef]int
+}
+
+func newSession(db *sql.DB, cfg Config, spec string, level Level, tag string, progress io.Writer) *session {
+	return &session{db: db, cfg: cfg, spec: spec, level: level, tag: tag, progress: progress, refByID: map[secretRef]int{}}
+}
+
+// expose renumbers a note's placeholders to session-wide ones.
+func (s *session) expose(noteID, text string) string {
+	return placeholderRe.ReplaceAllStringFunc(text, func(m string) string {
+		sub := placeholderRe.FindStringSubmatch(m)
+		n, _ := strconv.Atoi(sub[2])
+		ref := secretRef{noteID, n}
+		k, ok := s.refByID[ref]
+		if !ok {
+			s.refs = append(s.refs, ref)
+			k = len(s.refs)
+			s.refByID[ref] = k
+		}
+		return fmt.Sprintf("[REDACTED:%s#%d]", sub[1], k)
+	})
+}
+
+// secret returns the real value behind session placeholder #k, read from the note on disk.
+func (s *session) secret(k int) (value, noteID string, err error) {
+	if k < 1 || k > len(s.refs) {
+		return "", "", fmt.Errorf("unknown placeholder #%d", k)
+	}
+	ref := s.refs[k-1]
+	n, err := parseNote(notePath(ref.Note))
+	if err != nil {
+		return "", ref.Note, err
+	}
+	_, found := redact(n.Body, compileExtra(s.cfg.RedactPatterns))
+	if ref.N > len(found) {
+		return "", ref.Note, fmt.Errorf("note %s changed since it was read", ref.Note)
+	}
+	return found[ref.N-1].Value, ref.Note, nil
+}
+
+// ask sends a question (the first one or a follow-up) and runs the tool loop until the model answers.
+func (s *session) ask(ctx context.Context, question string, out io.Writer) (askResult, error) {
+	user := fmt.Sprintf("Question: %s", question)
+	if s.chat == nil {
+		user = fmt.Sprintf("Today is %s.\n\n%s", time.Now().Format("2006-01-02 (Monday)"), user)
+		if s.tag != "" {
+			user += fmt.Sprintf("\n\n(The user is asking about notes tagged #%s.)", s.tag)
+		}
 	}
 	// Run the obvious search locally (milliseconds) and hand over the results up front, so most
 	// questions are answered in a single model call instead of search → read → answer round trips.
-	pre, n := prefetch(db, question, tag)
+	pre, hits := s.prefetch(question)
 	user += "\n\n" + pre
-	if progress != nil {
-		fmt.Fprintln(progress, c("2", fmt.Sprintf("· prefetched %d notes", n)))
+	if s.progress != nil {
+		names := []string{}
+		for i, h := range hits {
+			if i == 4 {
+				names = append(names, "…")
+				break
+			}
+			names = append(names, h.ID)
+		}
+		if len(hits) == 0 {
+			fmt.Fprintln(s.progress, c("2", "· no matching notes, searching further…"))
+		} else {
+			fmt.Fprintln(s.progress, c("2", fmt.Sprintf("· found %d: %s", len(hits), strings.Join(names, ", "))))
+		}
 	}
-	chat, err := newChat(cfg, spec, agentSystem, user, agentTools, level)
-	if err != nil {
-		return askResult{}, err
+	if s.chat == nil {
+		chat, err := newChat(s.cfg, s.spec, agentSystem, user, agentTools, s.level)
+		if err != nil {
+			return askResult{}, err
+		}
+		s.chat = chat
+	} else {
+		s.chat.AddUser(user)
 	}
 	res := askResult{Steps: []string{}}
 	for step := 0; ; step++ {
-		last := step >= cfg.MaxSteps // out of budget: answer with what we have
-		text, calls, err := chat.Next(ctx, !last, out)
+		last := step >= s.cfg.MaxSteps // out of budget: answer with what we have
+		text, calls, err := s.chat.Next(ctx, !last, out)
 		if err != nil {
 			return res, err
 		}
@@ -91,22 +175,53 @@ func runAgent(ctx context.Context, db *sql.DB, cfg Config, spec, question, tag s
 		}
 		results := make([]string, len(calls))
 		for i, call := range calls {
-			out, summary := runTool(db, call)
-			results[i] = out
+			o, summary := s.runTool(call)
+			results[i] = o
 			line := call.Name + " " + summary
 			res.Steps = append(res.Steps, line)
-			if progress != nil {
-				fmt.Fprintln(progress, c("2", "· "+line))
+			if s.progress != nil {
+				fmt.Fprintln(s.progress, c("2", "· "+line))
 			}
 		}
-		chat.AddResults(calls, results)
+		s.chat.AddResults(calls, results)
 	}
-	res.Sources = cited(res.Answer, db)
+	res.Sources = cited(res.Answer, s.db)
 	return res, nil
 }
 
+// prefetch searches for the question's words and returns a results list plus the full (redacted)
+// text of the top notes, ready to put in the message.
+func (s *session) prefetch(question string) (string, []Hit) {
+	const list, full, perNote = 8, 3, 6000
+	q := ftsQuery(stripStopwords(question), "OR")
+	if q == "" {
+		return "Search results for it: none (no searchable words).", nil
+	}
+	if s.tag != "" {
+		q = "(" + q + ") AND " + tagQuery(s.tag)
+	}
+	hits, err := search(s.db, q, list, "", "", true)
+	if err != nil || len(hits) == 0 {
+		return "Search results for it: no matches. Try other words with the tools.", nil
+	}
+	var b strings.Builder
+	b.WriteString("Search results for it (best first):\n")
+	for _, h := range hits {
+		fmt.Fprintf(&b, "%s | %s | %s | %s\n  %s\n", h.ID, day(h.Created), s.expose(h.ID, h.Title), hashTags(h.Tags),
+			s.expose(h.ID, strings.ReplaceAll(h.Snippet, "\n", " ")))
+	}
+	b.WriteString("\nFull text of the top results:\n")
+	for i, h := range hits {
+		if i == full {
+			break
+		}
+		fmt.Fprintf(&b, "<note id=%q created=%q>\n%s\n</note>\n", h.ID, day(h.Created), s.expose(h.ID, clip(h.Body, perNote)))
+	}
+	return b.String(), hits
+}
+
 // runTool executes one tool call. Errors go back to the model as text so it can correct itself.
-func runTool(db *sql.DB, call ToolCall) (out, summary string) {
+func (s *session) runTool(call ToolCall) (out, summary string) {
 	var a struct {
 		Query, Tag, Pattern, Folder, ID string
 		Regex                           bool
@@ -117,18 +232,18 @@ func runTool(db *sql.DB, call ToolCall) (out, summary string) {
 	}
 	switch call.Name {
 	case "search":
-		return toolSearch(db, a.Query, a.Tag, clamp(a.Limit, 10, 30))
+		return s.toolSearch(a.Query, a.Tag, clamp(a.Limit, 10, 30))
 	case "grep":
-		return toolGrep(db, a.Pattern, a.Regex, a.Folder)
+		return s.toolGrep(a.Pattern, a.Regex, a.Folder)
 	case "list":
-		return toolList(db, a.Folder, a.Tag, clamp(a.Limit, 30, 100))
+		return s.toolList(a.Folder, a.Tag, clamp(a.Limit, 30, 100))
 	case "read":
-		return toolRead(db, a.ID, max(a.Offset, 1), clamp(a.Limit, 300, 1000))
+		return s.toolRead(a.ID, max(a.Offset, 1), clamp(a.Limit, 300, 1000))
 	}
 	return "error: unknown tool " + call.Name, "(unknown tool)"
 }
 
-func toolSearch(db *sql.DB, query, tag string, limit int) (string, string) {
+func (s *session) toolSearch(query, tag string, limit int) (string, string) {
 	sum := fmt.Sprintf("%q", query)
 	run := func(op string) ([]Hit, error) {
 		q := ftsQuery(query, op)
@@ -138,7 +253,7 @@ func toolSearch(db *sql.DB, query, tag string, limit int) (string, string) {
 		if tag != "" {
 			q = "(" + q + ") AND " + tagQuery(tag)
 		}
-		return search(db, q, limit, "", "")
+		return search(s.db, q, limit, "", "", true)
 	}
 	hits, err := run("AND")
 	if err == nil && len(hits) == 0 { // nothing has every word: rank by any of them
@@ -152,13 +267,13 @@ func toolSearch(db *sql.DB, query, tag string, limit int) (string, string) {
 	}
 	var b strings.Builder
 	for _, h := range hits {
-		fmt.Fprintf(&b, "%s | %s | %s | %s\n  %s\n", h.ID, day(h.Created), h.Title, hashTags(h.Tags),
-			strings.ReplaceAll(h.Snippet, "\n", " "))
+		fmt.Fprintf(&b, "%s | %s | %s | %s\n  %s\n", h.ID, day(h.Created), s.expose(h.ID, h.Title), hashTags(h.Tags),
+			s.expose(h.ID, strings.ReplaceAll(h.Snippet, "\n", " ")))
 	}
 	return b.String(), fmt.Sprintf("%s → %d", sum, len(hits))
 }
 
-func toolGrep(db *sql.DB, pattern string, isRegex bool, folder string) (string, string) {
+func (s *session) toolGrep(pattern string, isRegex bool, folder string) (string, string) {
 	sum := fmt.Sprintf("%q", pattern)
 	if pattern == "" {
 		return "error: empty pattern", sum
@@ -171,7 +286,7 @@ func toolGrep(db *sql.DB, pattern string, isRegex bool, folder string) (string, 
 	if err != nil {
 		return "error: bad regex: " + err.Error(), sum
 	}
-	hits, _, err := allNotes(db, "")
+	hits, _, err := allNotes(s.db, "", true)
 	if err != nil {
 		return "error: " + err.Error(), sum
 	}
@@ -188,7 +303,7 @@ func toolGrep(db *sql.DB, pattern string, isRegex bool, folder string) (string, 
 				continue
 			}
 			if n++; n <= maxLines {
-				fmt.Fprintf(&b, "%s:%d: %s\n", h.ID, i+1, clip(strings.TrimSpace(line), 240))
+				fmt.Fprintf(&b, "%s:%d: %s\n", h.ID, i+1, s.expose(h.ID, clip(strings.TrimSpace(line), 240)))
 			}
 			matched = true
 		}
@@ -205,15 +320,15 @@ func toolGrep(db *sql.DB, pattern string, isRegex bool, folder string) (string, 
 	return b.String(), fmt.Sprintf("%s → %d lines in %d notes", sum, n, notes)
 }
 
-func toolList(db *sql.DB, folder, tag string, limit int) (string, string) {
+func (s *session) toolList(folder, tag string, limit int) (string, string) {
 	if tag != "" {
-		hits, err := recent(db, tag, limit)
+		hits, err := recent(s.db, tag, limit, true)
 		if err != nil {
 			return "error: " + err.Error(), "#" + tag
 		}
-		return noteLines(hits), fmt.Sprintf("#%s → %d", tag, len(hits))
+		return s.noteLines(hits), fmt.Sprintf("#%s → %d", tag, len(hits))
 	}
-	all, _, err := allNotes(db, "")
+	all, _, err := allNotes(s.db, "", true)
 	if err != nil {
 		return "error: " + err.Error(), folder
 	}
@@ -231,8 +346,8 @@ func toolList(db *sql.DB, folder, tag string, limit int) (string, string) {
 		for _, f := range sortedByCount(counts) {
 			fmt.Fprintf(&b, "  %s/ (%d notes)\n", f, counts[f])
 		}
-		hits, _ := recent(db, "", min(limit, 15))
-		b.WriteString("Most recent notes:\n" + noteLines(hits))
+		hits, _ := recent(s.db, "", min(limit, 15), true)
+		b.WriteString("Most recent notes:\n" + s.noteLines(hits))
 		return b.String(), "(top level)"
 	}
 	sub := map[string]int{}
@@ -260,18 +375,21 @@ func toolList(db *sql.DB, folder, tag string, limit int) (string, string) {
 		fmt.Fprintf(&b, "(%d notes, showing the %d most recent)\n", len(direct), limit)
 		direct = direct[:limit]
 	}
-	b.WriteString(noteLines(direct))
+	b.WriteString(s.noteLines(direct))
 	return b.String(), fmt.Sprintf("%s → %d notes, %d folders", folder, len(direct), len(sub))
 }
 
-func toolRead(db *sql.DB, id string, offset, limit int) (string, string) {
-	p, err := resolve(db, id)
+func (s *session) toolRead(id string, offset, limit int) (string, string) {
+	p, err := resolve(s.db, id)
+	if err == nil && isPrivate(s.db, noteID(p)) {
+		err = fmt.Errorf("no note matching '%s'", id) // private notes don't exist for the model
+	}
 	if err != nil {
 		return "error: " + err.Error(), id
 	}
 	nid := noteID(p)
 	var created, tags, body string
-	if err := db.QueryRow("SELECT created, tags, body FROM fts WHERE id=?", nid).Scan(&created, &tags, &body); err != nil {
+	if err := s.db.QueryRow("SELECT created, tags, body FROM fts WHERE id=?", nid).Scan(&created, &tags, &body); err != nil {
 		return "error: " + err.Error(), nid
 	}
 	lines := strings.Split(body, "\n")
@@ -282,7 +400,7 @@ func toolRead(db *sql.DB, id string, offset, limit int) (string, string) {
 	var b strings.Builder
 	fmt.Fprintf(&b, "id: %s\ncreated: %s\ntags: %s\nlines %d-%d of %d\n---\n", nid, created, hashTags(strings.Fields(tags)), offset, end, len(lines))
 	for i := offset - 1; i < end; i++ {
-		fmt.Fprintf(&b, "%d\t%s\n", i+1, clip(lines[i], 2000))
+		fmt.Fprintf(&b, "%d\t%s\n", i+1, s.expose(nid, clip(lines[i], 2000)))
 		if b.Len() > 40_000 {
 			fmt.Fprintf(&b, "… stopped at line %d (size limit); continue with offset=%d\n", i+1, i+2)
 			break
@@ -291,35 +409,32 @@ func toolRead(db *sql.DB, id string, offset, limit int) (string, string) {
 	return b.String(), nid
 }
 
-// prefetch searches for the question's words and returns a results list plus the full (redacted)
-// text of the top notes, ready to put in the first message.
-func prefetch(db *sql.DB, question, tag string) (string, int) {
-	const list, full, perNote = 8, 3, 6000
-	q := ftsQuery(stripStopwords(question), "OR")
-	if q == "" {
-		return "Search results for the question: none (no searchable words).", 0
-	}
-	if tag != "" {
-		q = "(" + q + ") AND " + tagQuery(tag)
-	}
-	hits, err := search(db, q, list, "", "")
-	if err != nil || len(hits) == 0 {
-		return "Search results for the question: no matches. Try other words with the tools.", 0
-	}
+func (s *session) noteLines(hits []Hit) string {
 	var b strings.Builder
-	b.WriteString("Search results for the question (best first):\n")
 	for _, h := range hits {
-		fmt.Fprintf(&b, "%s | %s | %s | %s\n  %s\n", h.ID, day(h.Created), h.Title, hashTags(h.Tags),
-			strings.ReplaceAll(h.Snippet, "\n", " "))
+		fmt.Fprintf(&b, "  %s | %s | %s | %s\n", h.ID, day(h.Created), s.expose(h.ID, h.Title), hashTags(h.Tags))
 	}
-	b.WriteString("\nFull text of the top results:\n")
-	for i, h := range hits {
-		if i == full {
-			break
+	return b.String()
+}
+
+// warmUp opens the connection to an OpenAI-compatible API in the background (DNS, TCP, TLS)
+// while mem searches locally, so the first model call doesn't pay for the handshake.
+// (The Anthropic SDK keeps its own connection pool, so this only helps the openai path.)
+func warmUp(cfg Config, spec string) {
+	p, _, err := cfg.resolveModel(spec)
+	if err != nil || p.API != "openai" || p.BaseURL == "" {
+		return
+	}
+	go func() {
+		req, err := http.NewRequest("HEAD", strings.TrimRight(p.BaseURL, "/")+"/models", nil)
+		if err != nil {
+			return
 		}
-		fmt.Fprintf(&b, "<note id=%q created=%q>\n%s\n</note>\n", h.ID, day(h.Created), clip(h.Body, perNote))
-	}
-	return b.String(), len(hits)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			io.Copy(io.Discard, resp.Body)
+			resp.Body.Close() // the connection stays in the pool for the real request
+		}
+	}()
 }
 
 // Common words that only add noise to an OR search (English and Slovenian).
@@ -328,7 +443,7 @@ var stopwords = func() map[string]bool {
 	for _, w := range strings.Fields(`a an the and or but if of to in on at by for with from about as is are was were be been
 		do does did have has had i me my we our you your it its this that these those what which who whom when where why how
 		can could should would will may might must not no so than then there here any some all just get got tell show find
-		in je na za v z s pa ali kaj kje kdaj kako kdo zakaj ki se si sem so bo bi da ne to ta te tega moj moja moje mi me`) {
+		je na za v z s pa ali kaj kje kdaj kako kdo zakaj ki se si sem so bo bi da ne to ta te tega moj moja moje mi me`) {
 		m[w] = true
 	}
 	return m
@@ -346,13 +461,13 @@ func stripStopwords(s string) string {
 
 var citeRe = regexp.MustCompile(`\[([^\[\]\n]+)\]`)
 
-// cited returns the existing notes whose ids the answer cites, in order of first citation.
+// cited returns the existing, non-private notes whose ids the answer cites, in order of first citation.
 func cited(answer string, db *sql.DB) []Note {
 	out, seen := []Note{}, map[string]bool{}
 	for _, m := range citeRe.FindAllStringSubmatch(answer, -1) {
 		for _, id := range strings.Split(m[1], ",") { // "[a, b]" cites two notes
 			id = strings.TrimSpace(id)
-			if seen[id] || strings.HasPrefix(id, "REDACTED") {
+			if seen[id] || strings.HasPrefix(id, "REDACTED") || isPrivate(db, id) {
 				continue
 			}
 			var n Note
@@ -381,14 +496,6 @@ func obj(p props, required ...string) map[string]any {
 func str(d string) map[string]any     { return map[string]any{"type": "string", "description": d} }
 func integer(d string) map[string]any { return map[string]any{"type": "integer", "description": d} }
 func boolean(d string) map[string]any { return map[string]any{"type": "boolean", "description": d} }
-
-func noteLines(hits []Hit) string {
-	var b strings.Builder
-	for _, h := range hits {
-		fmt.Fprintf(&b, "  %s | %s | %s | %s\n", h.ID, day(h.Created), h.Title, hashTags(h.Tags))
-	}
-	return b.String()
-}
 
 func day(created string) string { return created[:min(len(created), 10)] }
 

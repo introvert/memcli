@@ -31,6 +31,11 @@ type Config struct {
 	FastModel string `json:"fast_model"` // small jobs (tagging, query expansion); defaults to Model
 	AutoTag   bool   `json:"auto_tag"`   // AI-suggest tags on every `mem add`
 	MaxSteps  int    `json:"max_steps"`  // tool-call rounds per `mem ask` before it must answer
+	// Notes the AI must never see, as folder/note paths or globs ("Kundix/Crypto", "**/keys*").
+	// A note can also opt out itself with `private: true` (or `ai: false`) in its frontmatter.
+	AIExclude []string `json:"ai_exclude"`
+	// Show the copy/run/follow-up menu after `mem ask` answers in a terminal (default true).
+	Actions *bool `json:"actions,omitempty"`
 	// Extra regexes to redact (on top of the built-in secret detection), e.g. "INTERNAL-\\d+".
 	RedactPatterns []string            `json:"redact_patterns"`
 	Providers      map[string]Provider `json:"providers"` // extra providers, or overrides of built-in ones
@@ -105,6 +110,7 @@ func writeDefaultConfig() error {
 		AutoTag:        false,
 		MaxSteps:       defaultMaxSteps,
 		RedactPatterns: []string{},
+		AIExclude:      []string{},
 		Providers: map[string]Provider{
 			"example-local": {API: "openai", BaseURL: "http://localhost:8080/v1"},
 		},
