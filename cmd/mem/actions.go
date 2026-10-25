@@ -143,8 +143,11 @@ func actionMenu(s *session, res askResult) {
 		}
 		listed = true
 		keys := []string{c("36", "a") + " copy answer"}
-		if len(items) > 0 {
-			keys = append([]string{c("36", "1-"+strconv.Itoa(len(items)))}, keys...)
+		switch n := len(items); {
+		case n == 1:
+			keys = append([]string{c("36", "1")}, keys...)
+		case n > 1:
+			keys = append([]string{c("36", "1-"+strconv.Itoa(n))}, keys...)
 		}
 		if len(res.Sources) > 0 {
 			keys = append(keys, c("36", "o")+" open "+res.Sources[0].ID)
@@ -241,10 +244,15 @@ func printSources(sources []Note) {
 	if len(sources) == 0 {
 		return
 	}
-	fmt.Println(c("2", "\nsources:"))
-	for _, n := range sources {
-		fmt.Println(c("2", "  "+n.ID+"  "+strings.TrimSpace(tagRe.ReplaceAllString(n.Title, ""))))
+	ids := make([]string, len(sources))
+	for i, n := range sources {
+		ids[i] = n.ID
 	}
+	label := "source: "
+	if len(ids) > 1 {
+		label = "sources: "
+	}
+	fmt.Println(c("2", label+strings.Join(ids, ", ")))
 }
 
 // ---------- terminal input ----------

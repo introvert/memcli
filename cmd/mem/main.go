@@ -177,6 +177,17 @@ func cmdSearch(args []string) {
 	}
 	hits, err := search(db, strings.Join(parts, " AND "), o.limit(20), on, off, false)
 	check(err)
+	if len(hits) == 0 && len(o.pos) > 0 { // maybe a typo: retry with the closest real words
+		if fixed, ok := correct(db, strings.Join(o.pos, " ")); ok {
+			q := ftsQuery(fixed, "OR")
+			if t, ok := o.kv["-t"]; ok {
+				q = "(" + q + ") AND " + tagQuery(t)
+			}
+			if hits, err = search(db, q, o.limit(20), on, off, false); err == nil && len(hits) > 0 && !o.flags["--json"] {
+				fmt.Println(c("2", fmt.Sprintf("no exact matches for %q; showing close matches", strings.Join(o.pos, " "))))
+			}
+		}
+	}
 	if o.flags["--json"] {
 		printJSON(notesOf(hits))
 		return

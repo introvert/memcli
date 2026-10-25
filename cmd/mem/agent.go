@@ -33,7 +33,8 @@ How to work:
   written in), read the promising notes, and stop as soon as you can answer.
 - Don't write any text in a turn where you call tools; write only the final answer.
 
-Answer in the language of the question, concisely, for a terminal (no markdown headings or tables).
+Answer in the language of the question: just the answer, as short as it can be, for a terminal (no
+markdown headings or tables). Don't remark on what the notes don't say unless they lack the answer.
 After each fact, cite the note id in square brackets exactly as the tools show it, e.g. [mem/261025-143012]
 or [Projects/ideas]. If the notes don't contain the answer, say so plainly instead of guessing.
 Put shell commands the user may run in a fenced block (` + "```sh" + `), one command per block, and values they
@@ -136,21 +137,23 @@ func (s *session) ask(ctx context.Context, question string, out io.Writer) (askR
 	}
 	// Run the obvious search locally (milliseconds) and hand over the results up front, so most
 	// questions are answered in a single model call instead of search → read → answer round trips.
-	pre, hits := s.prefetch(question)
+	pre, hits, fixed := s.prefetch(question)
 	user += "\n\n" + pre
 	if s.progress != nil {
-		names := []string{}
-		for i, h := range hits {
-			if i == 4 {
-				names = append(names, "…")
-				break
-			}
-			names = append(names, h.ID)
+		note := ""
+		if fixed {
+			note = " (corrected typos)"
 		}
 		if len(hits) == 0 {
-			fmt.Fprintln(s.progress, c("2", "· no matching notes, searching further…"))
+			fmt.Fprintln(s.progress, c("2", "· no matching notes, searching further…"+note))
 		} else {
-			fmt.Fprintln(s.progress, c("2", fmt.Sprintf("· found %d: %s", len(hits), strings.Join(names, ", "))))
+			fmt.Fprintln(s.progress, c("2", fmt.Sprintf("· %d notes matched%s", len(hits), note)))
+		}
+	}
+	rw := newRender(out)
+	flush := func() {
+		if r, ok := rw.(*render); ok {
+			r.Flush()
 		}
 	}
 	if s.chat == nil {
@@ -165,7 +168,8 @@ func (s *session) ask(ctx context.Context, question string, out io.Writer) (askR
 	res := askResult{Steps: []string{}}
 	for step := 0; ; step++ {
 		last := step >= s.cfg.MaxSteps // out of budget: answer with what we have
-		text, calls, err := s.chat.Next(ctx, !last, out)
+		text, calls, err := s.chat.Next(ctx, !last, rw)
+		flush()
 		if err != nil {
 			return res, err
 		}
@@ -191,18 +195,19 @@ func (s *session) ask(ctx context.Context, question string, out io.Writer) (askR
 
 // prefetch searches for the question's words and returns a results list plus the full (redacted)
 // text of the top notes, ready to put in the message.
-func (s *session) prefetch(question string) (string, []Hit) {
+func (s *session) prefetch(question string) (string, []Hit, bool) {
 	const list, full, perNote = 8, 3, 6000
-	q := ftsQuery(stripStopwords(question), "OR")
+	words, fixed := correct(s.db, stripStopwords(question))
+	q := ftsQuery(words, "OR")
 	if q == "" {
-		return "Search results for it: none (no searchable words).", nil
+		return "Search results for it: none (no searchable words).", nil, false
 	}
 	if s.tag != "" {
 		q = "(" + q + ") AND " + tagQuery(s.tag)
 	}
 	hits, err := search(s.db, q, list, "", "", true)
 	if err != nil || len(hits) == 0 {
-		return "Search results for it: no matches. Try other words with the tools.", nil
+		return "Search results for it: no matches. Try other words with the tools.", nil, fixed
 	}
 	var b strings.Builder
 	b.WriteString("Search results for it (best first):\n")
@@ -217,7 +222,7 @@ func (s *session) prefetch(question string) (string, []Hit) {
 		}
 		fmt.Fprintf(&b, "<note id=%q created=%q>\n%s\n</note>\n", h.ID, day(h.Created), s.expose(h.ID, clip(h.Body, perNote)))
 	}
-	return b.String(), hits
+	return b.String(), hits, fixed
 }
 
 // runTool executes one tool call. Errors go back to the model as text so it can correct itself.
@@ -258,6 +263,13 @@ func (s *session) toolSearch(query, tag string, limit int) (string, string) {
 	hits, err := run("AND")
 	if err == nil && len(hits) == 0 { // nothing has every word: rank by any of them
 		hits, err = run("OR")
+	}
+	if err == nil && len(hits) == 0 { // maybe a typo: retry with the closest real words
+		if fixedQ, ok := correct(s.db, query); ok {
+			query = fixedQ
+			hits, err = run("OR")
+			sum += " (corrected typos)"
+		}
 	}
 	if err != nil {
 		return "error: " + err.Error(), sum

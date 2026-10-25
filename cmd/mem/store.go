@@ -188,6 +188,9 @@ func addTagList(set map[string]bool, v string) {
 // titleOf is the first non-empty line without markdown heading marks, or the file name.
 func titleOf(body, path string) string {
 	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "```") {
+			continue // code fence markers aren't titles
+		}
 		if line = strings.TrimSpace(strings.TrimLeft(line, "# ")); line != "" {
 			if r := []rune(line); len(r) > 120 {
 				line = string(r[:120])
@@ -341,6 +344,7 @@ func openIndex() (*sql.DB, error) {
 		db.Exec("DELETE FROM files; DELETE FROM fts; DELETE FROM private;")
 		db.Exec("INSERT OR REPLACE INTO meta VALUES('notes_dir', ?)", want)
 	}
+	ensureVocab(db)
 	return db, syncIndex(db)
 }
 

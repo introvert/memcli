@@ -15,7 +15,7 @@ import (
 // `mem show` / `mem edit` read the files directly and are never redacted.
 
 // Bump when the rules change: the index is rebuilt with the new rules.
-const redactVersion = "6"
+const redactVersion = "7"
 
 //go:embed bip39.txt
 var bip39Raw string
