@@ -63,6 +63,8 @@ mem -e                          add in $EDITOR
 mem add -a "..."                add and let AI pick tags
 mem s oat milk [-t todo]        search (ranked, prefix-matching)
 mem ask "question"              AI agent searches your notes and answers, citing sources
+mem ask -d "question"           same, with deep thinking for hard questions (slower)
+mem key set deepseek            store an API key in the OS keychain (mem key ls / rm)
 mem secrets                     what the privacy filter hides from AI (values masked)
 mem ls [-n 20] [-t todo]        recent notes
 mem show ID                     print a note (ID prefix is enough)
@@ -99,6 +101,10 @@ can use the same memory. `-m provider/model` picks a model for one run.
   strings, then reads the notes it needs. Each step is shown as it runs; it answers within
   `max_steps` rounds and cites the notes it used. Only what the tools return is sent, never the
   whole folder.
+- **It's fast.** Before the first model call, mem runs the obvious search locally (milliseconds)
+  and sends the top matches plus the full text of the best notes, so most questions are answered
+  in one call; tools are only used when that isn't enough. Thinking is off by default (note lookups
+  don't need it) and the answer streams as it is written. `mem ask -d` turns deep thinking on.
 - **Secrets never leave your machine.** Everything the model sees passes through a redaction
   filter: known token formats (AWS, GitHub, GitLab, Slack, Stripe, OpenAI/Anthropic/DeepSeek-style
   `sk-…`, Google, JWT, SendGrid, npm/PyPI/Hugging Face, Telegram), private-key blocks, passwords in
@@ -112,7 +118,11 @@ can use the same memory. `-m provider/model` picks a model for one run.
 
 ## Models
 
-Default: `deepseek/deepseek-flash` (set `DEEPSEEK_API_KEY`). Any model works, written as
+Default: `deepseek/deepseek-flash`. Store the key once with `mem key set deepseek` — it goes to the
+macOS Keychain (Linux: Secret Service via `secret-tool`, else `~/.mem/keys.json` with mode 600) and
+is read only by mem, not exported to every program like a shell `export`. Lookup order: the env
+var (e.g. `DEEPSEEK_API_KEY`), the provider's `api_key_cmd` (e.g. `"op read op://Private/DeepSeek/key"`
+for 1Password), the keychain, then the key file. Any model works, written as
 `provider/model`:
 
 | Provider | Example | Key |
@@ -135,7 +145,7 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
   "model": "deepseek/deepseek-flash",
   "fast_model": "",
   "auto_tag": false,
-  "max_steps": 12,
+  "max_steps": 8,
   "redact_patterns": ["INTERNAL-\\d{6}"],
   "providers": {
     "my-server": { "api": "openai", "base_url": "http://localhost:8080/v1", "api_key_env": "MY_KEY" },
@@ -149,8 +159,8 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
 - `max_steps`: tool-call rounds per `ask` before the model must answer.
 - `redact_patterns`: extra regexes to hide from the model, on top of the built-in filter.
 - `options` are merged into every request body; `small_options` on top of them for small jobs
-  (`null` removes a key). Built-in DeepSeek defaults: low reasoning effort for the agent, thinking off
-  for small jobs.
+  (`null` removes a key). Built-in DeepSeek defaults: thinking off; `deep_options` (used by `ask -d`)
+  turn it on with high effort.
 - `MEM_MODEL=...` / `MEM_NOTES=...` override the model / notes folder for a shell session.
 - Privacy: the agent sends the model only what its tools return, after redaction. Use a local
   model (`ollama/...`) if even redacted notes must not leave your machine.

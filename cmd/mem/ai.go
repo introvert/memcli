@@ -1,17 +1,19 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
-	"os"
 	"regexp"
+	"sort"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
+	"github.com/anthropics/anthropic-sdk-go/option"
 	"github.com/anthropics/anthropic-sdk-go/shared/constant"
 )
 
@@ -23,35 +25,49 @@ type Tool struct {
 
 type ToolCall struct{ ID, Name, Args string }
 
+// Level is how hard the model should think: speed vs depth.
+type Level int
+
+const (
+	Quick  Level = iota // tagging and other one-shot jobs
+	Normal              // `mem ask`: lookups in notes don't need deep reasoning, so keep it fast
+	Deep                // `mem ask -d`: hard questions
+)
+
 // Chat is one conversation with a model, kept in the provider's native message format.
 type Chat interface {
-	// Next sends the conversation so far. It returns the model's text and any tool calls it wants
-	// run; no calls means the model is done. allowTools=false makes the model answer now.
-	Next(ctx context.Context, allowTools bool) (text string, calls []ToolCall, err error)
+	// Next sends the conversation so far and streams the model's text to out (if non-nil).
+	// It returns the text and any tool calls to run; no calls means the model is done.
+	// allowTools=false makes the model answer now.
+	Next(ctx context.Context, allowTools bool, out io.Writer) (text string, calls []ToolCall, err error)
 	// AddResults appends the outputs of the calls from the last Next, in the same order.
 	AddResults(calls []ToolCall, results []string)
 }
 
-// newChat starts a conversation. small=true is for quick jobs (tagging): less model effort.
-func newChat(cfg Config, spec, system, user string, tools []Tool, small bool) (Chat, error) {
+func newChat(cfg Config, spec, system, user string, tools []Tool, level Level) (Chat, error) {
 	p, model, err := cfg.resolveModel(spec)
+	if err != nil {
+		return nil, err
+	}
+	key, _, err := apiKey(p)
 	if err != nil {
 		return nil, err
 	}
 	switch p.API {
 	case "anthropic":
-		return newClaudeChat(model, system, user, tools, small), nil
+		// No key found: let the SDK use its own sources (e.g. an `ant auth login` profile).
+		return newClaudeChat(key, model, system, user, tools, level), nil
 	case "openai":
-		key := ""
-		if p.APIKeyEnv != "" {
-			if key = os.Getenv(p.APIKeyEnv); key == "" {
-				return nil, fmt.Errorf("%s is not set (needed for %s)", p.APIKeyEnv, spec)
-			}
+		if key == "" && (p.APIKeyEnv != "" || p.APIKeyCmd != "") {
+			return nil, fmt.Errorf("no API key for %s: run `mem key set %s` (or set %s)", p.Name, p.Name, p.APIKeyEnv)
 		}
 		opts := map[string]any{}
 		merge(opts, p.Options)
-		if small {
+		switch level {
+		case Quick:
 			merge(opts, p.SmallOptions)
+		case Deep:
+			merge(opts, p.DeepOptions)
 		}
 		return &openaiChat{
 			url: strings.TrimRight(p.BaseURL, "/") + "/chat/completions", key: key, model: model,
@@ -63,12 +79,12 @@ func newChat(cfg Config, spec, system, user string, tools []Tool, small bool) (C
 }
 
 // complete is a single tool-less request.
-func complete(ctx context.Context, cfg Config, spec, system, user string, small bool) (string, error) {
-	chat, err := newChat(cfg, spec, system, user, nil, small)
+func complete(ctx context.Context, cfg Config, spec, system, user string, level Level) (string, error) {
+	chat, err := newChat(cfg, spec, system, user, nil, level)
 	if err != nil {
 		return "", err
 	}
-	text, _, err := chat.Next(ctx, false)
+	text, _, err := chat.Next(ctx, false, nil)
 	return text, err
 }
 
@@ -87,10 +103,10 @@ var fallbackModels = map[string]bool{
 	"claude-fable-5-1": true, "claude-opus-5-5": true, "claude-opus-5": true, "claude-sonnet-5-5": true,
 }
 
-func newClaudeChat(model, system, user string, tools []Tool, small bool) *claudeChat {
+func newClaudeChat(key, model, system, user string, tools []Tool, level Level) *claudeChat {
 	params := anthropic.BetaMessageNewParams{
 		Model:     anthropic.Model(model),
-		MaxTokens: 16000,
+		MaxTokens: 32000,
 		System:    []anthropic.BetaTextBlockParam{{Text: system}},
 		Messages:  []anthropic.BetaMessageParam{anthropic.NewBetaUserMessage(anthropic.NewBetaTextBlock(user))},
 	}
@@ -104,9 +120,9 @@ func newClaudeChat(model, system, user string, tools []Tool, small bool) *claude
 		}})
 	}
 	if effortModels.MatchString(model) {
-		effort := anthropic.BetaOutputConfigEffortMedium
-		if small {
-			effort = anthropic.BetaOutputConfigEffortLow
+		effort := anthropic.BetaOutputConfigEffortLow
+		if level == Deep {
+			effort = anthropic.BetaOutputConfigEffortHigh
 		}
 		params.OutputConfig = anthropic.BetaOutputConfigParam{Effort: effort}
 	}
@@ -115,26 +131,44 @@ func newClaudeChat(model, system, user string, tools []Tool, small bool) *claude
 		params.Betas = []anthropic.AnthropicBeta{anthropic.AnthropicBetaServerSideFallback2026_07_01}
 		params.Fallbacks = anthropic.BetaFallbacksParamUnion{OfDefault: constant.ValueOf[constant.Default]()}
 	}
-	return &claudeChat{client: anthropic.NewClient(), params: params}
+	var opts []option.RequestOption
+	if key != "" {
+		opts = append(opts, option.WithAPIKey(key))
+	}
+	return &claudeChat{client: anthropic.NewClient(opts...), params: params}
 }
 
-func (c *claudeChat) Next(ctx context.Context, allowTools bool) (string, []ToolCall, error) {
+func (c *claudeChat) Next(ctx context.Context, allowTools bool, out io.Writer) (string, []ToolCall, error) {
 	p := c.params
 	if !allowTools && len(p.Tools) > 0 {
 		p.ToolChoice = anthropic.BetaToolChoiceUnionParam{OfNone: &anthropic.BetaToolChoiceNoneParam{}}
 	}
-	resp, err := c.client.Beta.Messages.New(ctx, p)
-	if err != nil {
+	stream := c.client.Beta.Messages.NewStreaming(ctx, p)
+	msg := anthropic.BetaMessage{}
+	for stream.Next() {
+		ev := stream.Current()
+		if err := msg.Accumulate(ev); err != nil {
+			return "", nil, err
+		}
+		if out != nil {
+			if d, ok := ev.AsAny().(anthropic.BetaRawContentBlockDeltaEvent); ok {
+				if t, ok := d.Delta.AsAny().(anthropic.BetaTextDelta); ok {
+					fmt.Fprint(out, t.Text)
+				}
+			}
+		}
+	}
+	if err := stream.Err(); err != nil {
 		return "", nil, err
 	}
-	if resp.StopReason == anthropic.BetaStopReasonRefusal {
-		return "", nil, fmt.Errorf("model declined the request (%s)", resp.StopDetails.Category)
+	if msg.StopReason == anthropic.BetaStopReasonRefusal {
+		return "", nil, fmt.Errorf("model declined the request (%s)", msg.StopDetails.Category)
 	}
 	// Keep the full assistant turn (incl. thinking blocks) in history, unchanged.
-	c.params.Messages = append(c.params.Messages, resp.ToParam())
+	c.params.Messages = append(c.params.Messages, msg.ToParam())
 	var text strings.Builder
 	var calls []ToolCall
-	for _, b := range resp.Content {
+	for _, b := range msg.Content {
 		switch v := b.AsAny().(type) {
 		case anthropic.BetaTextBlock:
 			text.WriteString(v.Text)
@@ -163,10 +197,10 @@ type openaiChat struct {
 	msgs            []map[string]any
 }
 
-func (o *openaiChat) Next(ctx context.Context, allowTools bool) (string, []ToolCall, error) {
+func (o *openaiChat) Next(ctx context.Context, allowTools bool, out io.Writer) (string, []ToolCall, error) {
 	req := map[string]any{}
 	merge(req, o.opts)
-	req["model"], req["messages"] = o.model, o.msgs
+	req["model"], req["messages"], req["stream"] = o.model, o.msgs, true
 	if len(o.tools) > 0 {
 		var tools []map[string]any
 		for _, t := range o.tools {
@@ -193,55 +227,96 @@ func (o *openaiChat) Next(ctx context.Context, allowTools bool) (string, []ToolC
 		return "", nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode >= 300 {
-		return "", nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw[:min(len(raw), 2000)])))
+		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 2000))
+		return "", nil, fmt.Errorf("%s: %s", resp.Status, strings.TrimSpace(string(raw)))
 	}
-	var out struct {
-		Choices []struct {
-			Message struct {
-				Content          string          `json:"content"`
-				ReasoningContent string          `json:"reasoning_content"`
-				ToolCalls        json.RawMessage `json:"tool_calls"`
-			} `json:"message"`
-		} `json:"choices"`
-		Error *struct {
-			Message string `json:"message"`
-		} `json:"error"`
+
+	// Server-sent events: text arrives in delta.content, tool calls in pieces keyed by index.
+	type callAcc struct{ id, name, args strings.Builder }
+	var text, reasoning strings.Builder
+	acc := map[int]*callAcc{}
+	sc := bufio.NewScanner(resp.Body)
+	sc.Buffer(make([]byte, 1<<20), 8<<20)
+	for sc.Scan() {
+		data, ok := strings.CutPrefix(sc.Text(), "data:")
+		if !ok {
+			continue
+		}
+		if data = strings.TrimSpace(data); data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content          string `json:"content"`
+					ReasoningContent string `json:"reasoning_content"`
+					ToolCalls        []struct {
+						Index    int    `json:"index"`
+						ID       string `json:"id"`
+						Function struct {
+							Name      string `json:"name"`
+							Arguments string `json:"arguments"`
+						} `json:"function"`
+					} `json:"tool_calls"`
+				} `json:"delta"`
+			} `json:"choices"`
+			Error *struct {
+				Message string `json:"message"`
+			} `json:"error"`
+		}
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			continue
+		}
+		if chunk.Error != nil {
+			return "", nil, fmt.Errorf("%s", chunk.Error.Message)
+		}
+		for _, ch := range chunk.Choices {
+			d := ch.Delta
+			text.WriteString(d.Content)
+			reasoning.WriteString(d.ReasoningContent)
+			if out != nil && d.Content != "" {
+				fmt.Fprint(out, d.Content)
+			}
+			for _, tc := range d.ToolCalls {
+				a := acc[tc.Index]
+				if a == nil {
+					a = &callAcc{}
+					acc[tc.Index] = a
+				}
+				a.id.WriteString(tc.ID)
+				a.name.WriteString(tc.Function.Name)
+				a.args.WriteString(tc.Function.Arguments)
+			}
+		}
 	}
-	if err := json.Unmarshal(raw, &out); err != nil {
-		return "", nil, fmt.Errorf("bad response: %v", err)
+	if err := sc.Err(); err != nil {
+		return "", nil, err
 	}
-	if out.Error != nil {
-		return "", nil, fmt.Errorf("%s", out.Error.Message)
+
+	idx := make([]int, 0, len(acc))
+	for i := range acc {
+		idx = append(idx, i)
 	}
-	if len(out.Choices) == 0 {
-		return "", nil, fmt.Errorf("empty response")
-	}
-	m := out.Choices[0].Message
+	sort.Ints(idx)
 	var calls []ToolCall
-	var parsed []struct {
-		ID       string `json:"id"`
-		Function struct {
-			Name      string `json:"name"`
-			Arguments string `json:"arguments"`
-		} `json:"function"`
+	var wire []map[string]any
+	for _, i := range idx {
+		a := acc[i]
+		call := ToolCall{ID: a.id.String(), Name: a.name.String(), Args: a.args.String()}
+		calls = append(calls, call)
+		wire = append(wire, map[string]any{"id": call.ID, "type": "function",
+			"function": map[string]any{"name": call.Name, "arguments": call.Args}})
 	}
-	if len(m.ToolCalls) > 0 && string(m.ToolCalls) != "null" {
-		json.Unmarshal(m.ToolCalls, &parsed)
+	msg := map[string]any{"role": "assistant", "content": text.String()}
+	if len(wire) > 0 {
+		msg["tool_calls"] = wire
 	}
-	for _, p := range parsed {
-		calls = append(calls, ToolCall{ID: p.ID, Name: p.Function.Name, Args: p.Function.Arguments})
-	}
-	msg := map[string]any{"role": "assistant", "content": m.Content}
-	if len(parsed) > 0 {
-		msg["tool_calls"] = m.ToolCalls
-	}
-	if m.ReasoningContent != "" { // DeepSeek requires it back on later turns when tools are used
-		msg["reasoning_content"] = m.ReasoningContent
+	if reasoning.Len() > 0 { // DeepSeek requires it back on later turns when tools are used
+		msg["reasoning_content"] = reasoning.String()
 	}
 	o.msgs = append(o.msgs, msg)
-	return m.Content, calls, nil
+	return text.String(), calls, nil
 }
 
 func (o *openaiChat) AddResults(calls []ToolCall, results []string) {

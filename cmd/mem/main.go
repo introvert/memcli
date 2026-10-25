@@ -24,7 +24,9 @@ const usage = `mem — tiny personal memory
   mem add -a "..."                add and let AI pick tags
   mem s oat milk [-t todo]        search (ranked, prefix-matching)
   mem ask "when does the pg password rotate?"   AI agent searches your notes and answers, citing sources
+  mem ask -d "..."                same, with deep thinking for hard questions (slower)
   mem secrets                     what the privacy filter hides from AI (values masked)
+  mem key set deepseek            store an API key in the OS keychain (mem key ls / rm)
   mem ls [-n 20] [-t todo]        recent notes
   mem show ID                     print a note (ID prefix is enough)
   mem edit ID                     open in $EDITOR
@@ -56,7 +58,7 @@ func main() {
 	cmds := map[string]func([]string){
 		"add": cmdAdd, "s": cmdSearch, "search": cmdSearch, "ask": cmdAsk,
 		"ls": cmdLs, "show": cmdShow, "cat": cmdShow, "edit": cmdEdit, "rm": cmdRm,
-		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets,
+		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets, "key": cmdKey,
 		"path": func([]string) { fmt.Println(notesD) },
 	}
 	switch args[0] {
@@ -190,10 +192,10 @@ func cmdSearch(args []string) {
 }
 
 func cmdAsk(args []string) {
-	o := parseOpts(args)
+	o := parseOpts(args, "-d")
 	question := strings.TrimSpace(strings.Join(o.pos, " "))
 	if question == "" {
-		die("usage: mem ask QUESTION [-t tag] [-m provider/model]")
+		die("usage: mem ask QUESTION [-d] [-t tag] [-m provider/model]")
 	}
 	cfg := loadConfig()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
@@ -201,17 +203,24 @@ func cmdAsk(args []string) {
 	db, err := openIndex()
 	check(err)
 
-	var progress io.Writer = os.Stderr // tool steps, so stdout stays just the answer
-	if o.flags["--json"] {
-		progress = nil
+	level := Normal
+	if o.flags["-d"] {
+		level = Deep
 	}
-	res, err := runAgent(ctx, db, cfg, pick(o, cfg.Model), question, o.kv["-t"], progress)
+	// Steps go to stderr and the answer streams to stdout, so `mem ask ... > file` stays clean.
+	var progress, out io.Writer = os.Stderr, os.Stdout
+	if o.flags["--json"] {
+		progress, out = nil, nil
+	}
+	res, err := runAgent(ctx, db, cfg, pick(o, cfg.Model), question, o.kv["-t"], level, progress, out)
+	if out != nil {
+		fmt.Println()
+	}
 	check(err)
 	if o.flags["--json"] {
 		printJSON(res)
 		return
 	}
-	fmt.Println(res.Answer)
 	if len(res.Sources) > 0 {
 		fmt.Println(c("2", "\nsources:"))
 		for _, n := range res.Sources {
@@ -347,16 +356,7 @@ func cmdConfig([]string) {
 	fmt.Println("fast_model: " + cfg.FastModel + c("2", "   (tagging)"))
 	fmt.Printf("max_steps:  %d%s\n", cfg.MaxSteps, c("2", "   (tool calls per ask)"))
 	fmt.Printf("auto_tag:   %v\n", cfg.AutoTag)
-	names := []string{}
-	for n := range builtinProviders {
-		names = append(names, n)
-	}
-	for n := range cfg.Providers {
-		if _, ok := builtinProviders[n]; !ok {
-			names = append(names, n)
-		}
-	}
-	sort.Strings(names)
+	names := providerNames(cfg)
 	fmt.Println("providers:  " + strings.Join(names, ", "))
 	fmt.Println(c("2", "override per run: mem ask -m ollama/llama3.2 ... · or MEM_MODEL=gemini/gemini-2.5-flash"))
 }
@@ -387,7 +387,7 @@ func suggestTags(cfg Config, spec, body string) ([]string, error) {
 	defer cancel()
 	safe, _ := redact(body, compileExtra(cfg.RedactPatterns))
 	out, err := complete(ctx, cfg, spec, tagSystem,
-		fmt.Sprintf("Existing tags: %s\n\n<note>\n%s\n</note>", orNone(existing), safe), true)
+		fmt.Sprintf("Existing tags: %s\n\n<note>\n%s\n</note>", orNone(existing), safe), Quick)
 	if err != nil {
 		return nil, err
 	}

@@ -27,7 +27,10 @@ notes, which you can only see through tools:
 How to work:
 - Try a few phrasings: synonyms, related terms, and any other language the notes may be written in.
 - Read the most promising notes before answering; snippets alone can mislead.
-- Be efficient: stop as soon as you can answer. Several independent lookups can go in one turn.
+- Speed matters. The user's message already contains search results for the question, with the
+  best notes in full: if they answer it, answer right away without calling tools. Otherwise make
+  several independent lookups in the same turn, and stop as soon as you can answer.
+- Don't write any text in a turn where you call tools; write only the final answer.
 
 Answer in the language of the question, concisely, in plain text for a terminal (no markdown headings).
 After each fact, cite the note id in square brackets exactly as the tools show it, e.g. [mem/261025-143012]
@@ -59,19 +62,26 @@ type askResult struct {
 	Steps   []string `json:"steps"`
 }
 
-func runAgent(ctx context.Context, db *sql.DB, cfg Config, spec, question, tag string, progress io.Writer) (askResult, error) {
+func runAgent(ctx context.Context, db *sql.DB, cfg Config, spec, question, tag string, level Level, progress, out io.Writer) (askResult, error) {
 	user := fmt.Sprintf("Today is %s.\n\nQuestion: %s", time.Now().Format("2006-01-02 (Monday)"), question)
 	if tag != "" {
 		user += fmt.Sprintf("\n\n(The user is asking about notes tagged #%s.)", tag)
 	}
-	chat, err := newChat(cfg, spec, agentSystem, user, agentTools, false)
+	// Run the obvious search locally (milliseconds) and hand over the results up front, so most
+	// questions are answered in a single model call instead of search → read → answer round trips.
+	pre, n := prefetch(db, question, tag)
+	user += "\n\n" + pre
+	if progress != nil {
+		fmt.Fprintln(progress, c("2", fmt.Sprintf("· prefetched %d notes", n)))
+	}
+	chat, err := newChat(cfg, spec, agentSystem, user, agentTools, level)
 	if err != nil {
 		return askResult{}, err
 	}
 	res := askResult{Steps: []string{}}
 	for step := 0; ; step++ {
 		last := step >= cfg.MaxSteps // out of budget: answer with what we have
-		text, calls, err := chat.Next(ctx, !last)
+		text, calls, err := chat.Next(ctx, !last, out)
 		if err != nil {
 			return res, err
 		}
@@ -279,6 +289,59 @@ func toolRead(db *sql.DB, id string, offset, limit int) (string, string) {
 		}
 	}
 	return b.String(), nid
+}
+
+// prefetch searches for the question's words and returns a results list plus the full (redacted)
+// text of the top notes, ready to put in the first message.
+func prefetch(db *sql.DB, question, tag string) (string, int) {
+	const list, full, perNote = 8, 3, 6000
+	q := ftsQuery(stripStopwords(question), "OR")
+	if q == "" {
+		return "Search results for the question: none (no searchable words).", 0
+	}
+	if tag != "" {
+		q = "(" + q + ") AND " + tagQuery(tag)
+	}
+	hits, err := search(db, q, list, "", "")
+	if err != nil || len(hits) == 0 {
+		return "Search results for the question: no matches. Try other words with the tools.", 0
+	}
+	var b strings.Builder
+	b.WriteString("Search results for the question (best first):\n")
+	for _, h := range hits {
+		fmt.Fprintf(&b, "%s | %s | %s | %s\n  %s\n", h.ID, day(h.Created), h.Title, hashTags(h.Tags),
+			strings.ReplaceAll(h.Snippet, "\n", " "))
+	}
+	b.WriteString("\nFull text of the top results:\n")
+	for i, h := range hits {
+		if i == full {
+			break
+		}
+		fmt.Fprintf(&b, "<note id=%q created=%q>\n%s\n</note>\n", h.ID, day(h.Created), clip(h.Body, perNote))
+	}
+	return b.String(), len(hits)
+}
+
+// Common words that only add noise to an OR search (English and Slovenian).
+var stopwords = func() map[string]bool {
+	m := map[string]bool{}
+	for _, w := range strings.Fields(`a an the and or but if of to in on at by for with from about as is are was were be been
+		do does did have has had i me my we our you your it its this that these those what which who whom when where why how
+		can could should would will may might must not no so than then there here any some all just get got tell show find
+		in je na za v z s pa ali kaj kje kdaj kako kdo zakaj ki se si sem so bo bi da ne to ta te tega moj moja moje mi me`) {
+		m[w] = true
+	}
+	return m
+}()
+
+func stripStopwords(s string) string {
+	var keep []string
+	for _, t := range tokenRe.FindAllString(strings.ToLower(s), -1) {
+		if !stopwords[t] {
+			keep = append(keep, t)
+		}
+	}
+	return strings.Join(keep, " ")
 }
 
 var citeRe = regexp.MustCompile(`\[([^\[\]\n]+)\]`)
