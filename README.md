@@ -8,12 +8,18 @@ $ mem "staging db: pg-staging.internal:5432, user app_ro #work #infra"
 saved 261025-235030
 $ mem s staging
 261025-235030  2026-10-25  staging db: pg-staging.internal:5432, user app_ro  #infra #work
-$ mem ask "what's the staging db host?"
-pg-staging.internal:5432, user app_ro [261025-235030].
+$ mem ask "what are the staging db credentials?"
+· search "staging database" → 2
+· read mem/261025-235030
+Host pg-staging.internal:5432, user app_ro [mem/261025-235030]. The password is redacted;
+run: mem show mem/261025-235030
 
 sources:
-  261025-235030  staging db: pg-staging.internal:5432, user app_ro
+  mem/261025-235030  staging db: pg-staging.internal:5432, user app_ro
 ```
+
+(Illustrative output.) `ask` runs a small agent that searches, greps and reads your notes —
+and a privacy filter makes sure passwords, tokens and keys never reach the model.
 
 ## Install
 
@@ -56,7 +62,8 @@ echo "..." | mem                add from stdin
 mem -e                          add in $EDITOR
 mem add -a "..."                add and let AI pick tags
 mem s oat milk [-t todo]        search (ranked, prefix-matching)
-mem ask "question"              AI answer from your notes, citing sources
+mem ask "question"              AI agent searches your notes and answers, citing sources
+mem secrets                     what the privacy filter hides from AI (values masked)
 mem ls [-n 20] [-t todo]        recent notes
 mem show ID                     print a note (ID prefix is enough)
 mem edit ID                     open in $EDITOR
@@ -86,9 +93,21 @@ can use the same memory. `-m provider/model` picks a model for one run.
   cache: it refreshes from file mtimes on every run, and deleting it loses nothing.
 - **Git**: if the notes folder is in a git repo, every add/edit/rm is committed automatically.
   `rm` moves notes to `.trash/` in the notes folder (the same place Obsidian uses).
-- **`mem ask`** sends all your notes to the model in one call while they fit in `context_budget`
-  (best recall). Notes go first, oldest first, so providers' prompt caching reuses that prefix
-  between questions. Past the budget it falls back to search, widened with AI-suggested keywords.
+- **`mem ask` is an agent.** The model gets four tools — `search` (ranked full-text), `grep`
+  (exact text/regex, returns matching lines), `list` (folders, tags, recent notes) and `read`
+  (a note with line numbers) — and decides what to look up: synonyms, other languages, exact
+  strings, then reads the notes it needs. Each step is shown as it runs; it answers within
+  `max_steps` rounds and cites the notes it used. Only what the tools return is sent, never the
+  whole folder.
+- **Secrets never leave your machine.** Everything the model sees passes through a redaction
+  filter: known token formats (AWS, GitHub, GitLab, Slack, Stripe, OpenAI/Anthropic/DeepSeek-style
+  `sk-…`, Google, JWT, SendGrid, npm/PyPI/Hugging Face, Telegram), private-key blocks, passwords in
+  URLs, values after labels like `password:`, `token=`, `api_key`, `secret`, `geslo`, crypto seed
+  phrases (BIP-39) and private keys, card numbers, and unknown high-entropy keys. The model sees
+  `[REDACTED:kind]` and can point you to the note; `mem show` displays the real value locally.
+  The search index itself stores only redacted text, so secrets can't be probed by searching for
+  guesses either. Run `mem secrets` to review what is caught; add your own patterns with
+  `redact_patterns`.
 - **AI is optional.** Adding, searching and listing work offline; only `ask` and `-a` call a model.
 
 ## Models
@@ -116,7 +135,8 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
   "model": "deepseek/deepseek-flash",
   "fast_model": "",
   "auto_tag": false,
-  "context_budget": 400000,
+  "max_steps": 12,
+  "redact_patterns": ["INTERNAL-\\d{6}"],
   "providers": {
     "my-server": { "api": "openai", "base_url": "http://localhost:8080/v1", "api_key_env": "MY_KEY" },
     "deepseek":  { "options": { "reasoning_effort": "high" } }
@@ -124,11 +144,13 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
 }
 ```
 
-- `fast_model` handles small jobs (tagging, keyword expansion); defaults to `model`.
+- `fast_model` handles small jobs (tagging); defaults to `model`. The agent needs a model with
+  tool/function calling (DeepSeek, Claude, OpenAI, Gemini, most Ollama models like `qwen3`, `llama3.1+`).
+- `max_steps`: tool-call rounds per `ask` before the model must answer.
+- `redact_patterns`: extra regexes to hide from the model, on top of the built-in filter.
 - `options` are merged into every request body; `small_options` on top of them for small jobs
-  (`null` removes a key). Built-in DeepSeek defaults: low reasoning effort for `ask`, thinking off
+  (`null` removes a key). Built-in DeepSeek defaults: low reasoning effort for the agent, thinking off
   for small jobs.
-- Lower `context_budget` (e.g. `20000`) for local models with small context windows.
 - `MEM_MODEL=...` / `MEM_NOTES=...` override the model / notes folder for a shell session.
-- Privacy: `mem ask` sends your notes (all of them, while under `context_budget`) to the
-  configured provider. Use a local model (`ollama/...`) if they must not leave your machine.
+- Privacy: the agent sends the model only what its tools return, after redaction. Use a local
+  model (`ollama/...`) if even redacted notes must not leave your machine.

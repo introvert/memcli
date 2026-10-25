@@ -4,7 +4,6 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -24,7 +23,8 @@ const usage = `mem — tiny personal memory
   mem -e                          add in $EDITOR
   mem add -a "..."                add and let AI pick tags
   mem s oat milk [-t todo]        search (ranked, prefix-matching)
-  mem ask "when does the pg password rotate?"   AI answer from your notes, citing sources
+  mem ask "when does the pg password rotate?"   AI agent searches your notes and answers, citing sources
+  mem secrets                     what the privacy filter hides from AI (values masked)
   mem ls [-n 20] [-t todo]        recent notes
   mem show ID                     print a note (ID prefix is enough)
   mem edit ID                     open in $EDITOR
@@ -56,7 +56,7 @@ func main() {
 	cmds := map[string]func([]string){
 		"add": cmdAdd, "s": cmdSearch, "search": cmdSearch, "ask": cmdAsk,
 		"ls": cmdLs, "show": cmdShow, "cat": cmdShow, "edit": cmdEdit, "rm": cmdRm,
-		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex,
+		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets,
 		"path": func([]string) { fmt.Println(notesD) },
 	}
 	switch args[0] {
@@ -198,84 +198,65 @@ func cmdAsk(args []string) {
 	cfg := loadConfig()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
-
-	llm, err := newLLM(cfg, pick(o, cfg.Model))
-	check(err)
 	db, err := openIndex()
 	check(err)
 
-	// Small collections: send everything (perfect recall, one model call).
-	// Large ones: search, widened with AI-suggested keywords.
-	hits, size, err := allNotes(db, o.kv["-t"])
-	check(err)
-	mode := "all"
-	if size > cfg.ContextBudget {
-		hits, mode = retrieve(ctx, db, cfg, o, question), "search"
-	}
-	// Notes first and the date/question last, so the long prefix is cacheable between asks.
-	user := fmt.Sprintf("<notes>\n%s</notes>\n\nToday is %s.\nQuestion: %s",
-		notesContext(hits), time.Now().Format("2006-01-02 (Monday)"), question)
-
-	var out io.Writer = os.Stdout
+	var progress io.Writer = os.Stderr // tool steps, so stdout stays just the answer
 	if o.flags["--json"] {
-		out = nil
+		progress = nil
 	}
-	answer, err := llm.Complete(ctx, askSystem, user, false, out)
-	if out != nil {
-		fmt.Println()
-	}
+	res, err := runAgent(ctx, db, cfg, pick(o, cfg.Model), question, o.kv["-t"], progress)
 	check(err)
-	sources := cited(answer, hits)
 	if o.flags["--json"] {
-		printJSON(map[string]any{"answer": strings.TrimSpace(answer), "sources": sources, "mode": mode, "notes_sent": len(hits)})
+		printJSON(res)
 		return
 	}
-	if len(sources) > 0 {
+	fmt.Println(res.Answer)
+	if len(res.Sources) > 0 {
 		fmt.Println(c("2", "\nsources:"))
-		for _, n := range sources {
+		for _, n := range res.Sources {
 			fmt.Println(c("2", "  "+n.ID+"  "+strings.TrimSpace(tagRe.ReplaceAllString(n.Title, ""))))
 		}
 	}
 }
 
-// retrieve finds candidate notes for a question: a broad keyword search, widened by
-// AI-suggested synonyms, falling back to the most recent notes when nothing matches.
-func retrieve(ctx context.Context, db *sql.DB, cfg Config, o opts, question string) []Hit {
-	const max = 25
-	tag := o.kv["-t"]
-	seen := map[string]bool{}
-	var hits []Hit
-	add := func(text string) {
-		q := ftsQuery(text, "OR")
-		if q == "" {
-			return
-		}
-		if tag != "" {
-			q = "(" + q + ") AND " + tagQuery(tag)
-		}
-		found, err := search(db, q, max, "", "")
+// cmdSecrets lists what the privacy filter redacts, so you can check it (values masked).
+func cmdSecrets(args []string) {
+	o := parseOpts(args)
+	extra := compileExtra(loadConfig().RedactPatterns)
+	ids := walkNotes()
+	keys := make([]string, 0, len(ids))
+	for id := range ids {
+		keys = append(keys, id)
+	}
+	sort.Strings(keys)
+	type row struct {
+		ID   string `json:"id"`
+		Line int    `json:"line"`
+		Kind string `json:"kind"`
+		Mask string `json:"masked"`
+	}
+	rows := []row{}
+	for _, id := range keys {
+		n, err := parseNote(ids[id])
 		if err != nil {
-			return
+			continue
 		}
-		for _, h := range found {
-			if !seen[h.ID] && len(hits) < max {
-				seen[h.ID] = true
-				hits = append(hits, h)
-			}
+		_, found := redact(n.Body, extra)
+		for _, f := range found {
+			rows = append(rows, row{id, f.Line, f.Kind, f.Preview})
 		}
 	}
-	add(stripStopwords(question))
-	if llm, err := newLLM(cfg, pick(o, cfg.FastModel)); err == nil {
-		if kw, err := llm.Complete(ctx, expandSystem, question, true, nil); err == nil {
-			add(kw)
-		} else {
-			warn("query expansion skipped: %v", err)
-		}
+	if o.flags["--json"] {
+		printJSON(rows)
+		return
 	}
-	if len(hits) == 0 {
-		hits, _ = recent(db, tag, max)
+	notes := map[string]bool{}
+	for _, r := range rows {
+		notes[r.ID] = true
+		fmt.Printf("%s:%d  %s  %s\n", c("36", r.ID), r.Line, c("33", r.Kind), c("2", r.Mask))
 	}
-	return hits
+	fmt.Println(c("2", fmt.Sprintf("%d redactions in %d notes · AI only ever sees [REDACTED:kind]", len(rows), len(notes))))
 }
 
 func cmdLs(args []string) {
@@ -363,7 +344,8 @@ func cmdConfig([]string) {
 	fmt.Println("config:     " + configPath)
 	fmt.Println("notes_dir:  " + notesD + c("2", "   (new notes → "+inboxD+")"))
 	fmt.Println("model:      " + cfg.Model + c("2", "   (mem ask)"))
-	fmt.Println("fast_model: " + cfg.FastModel + c("2", "   (tagging, query expansion)"))
+	fmt.Println("fast_model: " + cfg.FastModel + c("2", "   (tagging)"))
+	fmt.Printf("max_steps:  %d%s\n", cfg.MaxSteps, c("2", "   (tool calls per ask)"))
 	fmt.Printf("auto_tag:   %v\n", cfg.AutoTag)
 	names := []string{}
 	for n := range builtinProviders {
@@ -391,10 +373,6 @@ func cmdReindex([]string) {
 // ---------- AI helpers ----------
 
 func suggestTags(cfg Config, spec, body string) ([]string, error) {
-	llm, err := newLLM(cfg, spec)
-	if err != nil {
-		return nil, err
-	}
 	existing := ""
 	if db, err := openIndex(); err == nil {
 		if counts, err := tagCounts(db); err == nil {
@@ -407,8 +385,9 @@ func suggestTags(cfg Config, spec, body string) ([]string, error) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	out, err := llm.Complete(ctx, tagSystem,
-		fmt.Sprintf("Existing tags: %s\n\n<note>\n%s\n</note>", orNone(existing), body), true, nil)
+	safe, _ := redact(body, compileExtra(cfg.RedactPatterns))
+	out, err := complete(ctx, cfg, spec, tagSystem,
+		fmt.Sprintf("Existing tags: %s\n\n<note>\n%s\n</note>", orNone(existing), safe), true)
 	if err != nil {
 		return nil, err
 	}
@@ -420,26 +399,6 @@ func pick(o opts, def string) string {
 		return m
 	}
 	return def
-}
-
-var stopwords = map[string]bool{}
-
-func init() {
-	for _, w := range strings.Fields(`a an the and or but if of to in on at by for with from about as is are was were be been
-		do does did have has had i me my we our you your it its this that these those what which who whom when where why how
-		can could should would will shall may might must not no yes so than then there here any some all just did done get got`) {
-		stopwords[w] = true
-	}
-}
-
-func stripStopwords(s string) string {
-	var keep []string
-	for _, t := range tokenRe.FindAllString(strings.ToLower(s), -1) {
-		if !stopwords[t] {
-			keep = append(keep, t)
-		}
-	}
-	return strings.Join(keep, " ")
 }
 
 // ---------- output & misc ----------

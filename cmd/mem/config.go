@@ -26,10 +26,10 @@ type Config struct {
 	Model     string `json:"model"`      // "provider/model", used for `mem ask`
 	FastModel string `json:"fast_model"` // small jobs (tagging, query expansion); defaults to Model
 	AutoTag   bool   `json:"auto_tag"`   // AI-suggest tags on every `mem add`
-	// `mem ask` sends ALL notes (best recall, one call) while their total size is under this
-	// many characters; above it, it falls back to search. Lower it for small local models.
-	ContextBudget int                 `json:"context_budget"`
-	Providers     map[string]Provider `json:"providers"` // extra providers, or overrides of built-in ones
+	MaxSteps  int    `json:"max_steps"`  // tool-call rounds per `mem ask` before it must answer
+	// Extra regexes to redact (on top of the built-in secret detection), e.g. "INTERNAL-\\d+".
+	RedactPatterns []string            `json:"redact_patterns"`
+	Providers      map[string]Provider `json:"providers"` // extra providers, or overrides of built-in ones
 }
 
 var builtinProviders = map[string]Provider{
@@ -39,7 +39,7 @@ var builtinProviders = map[string]Provider{
 	"gemini":     {API: "openai", BaseURL: "https://generativelanguage.googleapis.com/v1beta/openai", APIKeyEnv: "GEMINI_API_KEY"},
 	"groq":       {API: "openai", BaseURL: "https://api.groq.com/openai/v1", APIKeyEnv: "GROQ_API_KEY"},
 	"mistral":    {API: "openai", BaseURL: "https://api.mistral.ai/v1", APIKeyEnv: "MISTRAL_API_KEY"},
-	// deepseek-flash thinks by default (high effort): keep it low for answers, off for small jobs.
+	// deepseek-flash thinks by default (high effort): keep it low for the agent, off for small jobs.
 	"deepseek": {API: "openai", BaseURL: "https://api.deepseek.com", APIKeyEnv: "DEEPSEEK_API_KEY",
 		Options:      map[string]any{"reasoning_effort": "low"},
 		SmallOptions: map[string]any{"reasoning_effort": nil, "thinking": map[string]any{"type": "disabled"}}},
@@ -49,8 +49,8 @@ var builtinProviders = map[string]Provider{
 }
 
 const (
-	defaultModel  = "deepseek/deepseek-flash"
-	defaultBudget = 400_000 // chars, roughly 100k tokens
+	defaultModel    = "deepseek/deepseek-flash"
+	defaultMaxSteps = 12
 )
 
 var configPath = filepath.Join(home, "config.json")
@@ -61,7 +61,7 @@ func loadConfig() Config {
 	if loaded != nil {
 		return *loaded
 	}
-	cfg := Config{NotesDir: filepath.Join(home, "notes"), Model: defaultModel, ContextBudget: defaultBudget}
+	cfg := Config{NotesDir: filepath.Join(home, "notes"), Model: defaultModel, MaxSteps: defaultMaxSteps}
 	if b, err := os.ReadFile(configPath); err == nil {
 		if err := json.Unmarshal(b, &cfg); err != nil {
 			die("bad %s: %v", configPath, err)
@@ -93,12 +93,13 @@ func writeDefaultConfig() error {
 	}
 	os.MkdirAll(home, 0o755)
 	b, _ := json.MarshalIndent(Config{
-		NotesDir:      filepath.Join(home, "notes"),
-		Inbox:         "",
-		Model:         defaultModel,
-		FastModel:     "",
-		AutoTag:       false,
-		ContextBudget: defaultBudget,
+		NotesDir:       filepath.Join(home, "notes"),
+		Inbox:          "",
+		Model:          defaultModel,
+		FastModel:      "",
+		AutoTag:        false,
+		MaxSteps:       defaultMaxSteps,
+		RedactPatterns: []string{},
 		Providers: map[string]Provider{
 			"example-local": {API: "openai", BaseURL: "http://localhost:8080/v1"},
 		},

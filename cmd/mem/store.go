@@ -279,9 +279,11 @@ func openIndex() (*sql.DB, error) {
 	// The index belongs to one notes dir; if the config points elsewhere now, start over.
 	var dir string
 	db.QueryRow("SELECT v FROM meta WHERE k='notes_dir'").Scan(&dir)
-	if dir != notesD {
+	// Same for the redaction rules: the index only ever holds redacted text.
+	want := notesD + "|" + redactVersion + "|" + strings.Join(loadConfig().RedactPatterns, "\x00")
+	if dir != want {
 		db.Exec("DELETE FROM files; DELETE FROM fts;")
-		db.Exec("INSERT OR REPLACE INTO meta VALUES('notes_dir', ?)", notesD)
+		db.Exec("INSERT OR REPLACE INTO meta VALUES('notes_dir', ?)", want)
 	}
 	return db, syncIndex(db)
 }
@@ -325,6 +327,7 @@ func syncIndex(db *sql.DB) error {
 		return err
 	}
 	defer tx.Rollback()
+	extra := compileExtra(loadConfig().RedactPatterns)
 	for id := range known {
 		if _, ok := onDisk[id]; !ok {
 			tx.Exec("DELETE FROM files WHERE id=?", id)
@@ -344,8 +347,9 @@ func syncIndex(db *sql.DB) error {
 		if err != nil {
 			continue
 		}
+		body, _ := redact(n.Body, extra)
 		tx.Exec("DELETE FROM fts WHERE id=?", id)
-		tx.Exec("INSERT INTO fts VALUES(?,?,?,?,?)", id, n.Created, n.Title, n.Body, strings.Join(n.Tags, " "))
+		tx.Exec("INSERT INTO fts VALUES(?,?,?,?,?)", id, n.Created, titleOf(body, p), body, strings.Join(n.Tags, " "))
 		tx.Exec("INSERT OR REPLACE INTO files VALUES(?,?)", id, mt)
 	}
 	return tx.Commit()
