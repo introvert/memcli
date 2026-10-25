@@ -198,7 +198,8 @@ func merge(dst, src map[string]any) {
 const askSystem = `You answer questions using the user's personal notes, provided in <note> tags
 (either all of their notes, or the ones a search found).
 Answer directly and concisely in plain text suitable for a terminal (no markdown headings).
-After each fact you use, cite its note id in square brackets, e.g. [261025-143012].
+After each fact you use, cite its note id exactly as given, in square brackets, e.g. [mem/261025-143012]
+or [Projects/Ideas].
 If the notes don't contain the answer, say so plainly instead of guessing.`
 
 const expandSystem = `You turn a question into search keywords for a full-text search over personal notes.
@@ -208,7 +209,7 @@ related terms someone might have used when writing the note. Space-separated, lo
 const tagSystem = `You pick tags for a personal note. Reply with 1-3 short lowercase tags, comma-separated,
 nothing else. Strongly prefer tags from the existing list when one fits; invent a new one only if none do.`
 
-var citeRe = regexp.MustCompile(`\d{6}-\d{6}(?:-\d+)?`)
+var citeRe = regexp.MustCompile(`\[([^\[\]\n]+)\]`)
 
 // cited returns the notes whose ids appear in the answer, in the order first cited.
 func cited(answer string, hits []Hit) []Note {
@@ -217,10 +218,13 @@ func cited(answer string, hits []Hit) []Note {
 		byID[h.ID] = h.Note
 	}
 	out, seen := []Note{}, map[string]bool{}
-	for _, id := range citeRe.FindAllString(answer, -1) {
-		if n, ok := byID[id]; ok && !seen[id] {
-			seen[id] = true
-			out = append(out, n)
+	for _, m := range citeRe.FindAllStringSubmatch(answer, -1) {
+		for _, id := range strings.Split(m[1], ",") { // "[a, b]" cites two notes
+			id = strings.TrimSpace(id)
+			if n, ok := byID[id]; ok && !seen[id] {
+				seen[id] = true
+				out = append(out, n)
+			}
 		}
 	}
 	return out

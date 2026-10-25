@@ -21,6 +21,8 @@ type Provider struct {
 }
 
 type Config struct {
+	NotesDir  string `json:"notes_dir"`  // where notes live (any folder of .md files, e.g. an Obsidian vault)
+	Inbox     string `json:"inbox"`      // subfolder of notes_dir for notes created by mem ("" = top level)
 	Model     string `json:"model"`      // "provider/model", used for `mem ask`
 	FastModel string `json:"fast_model"` // small jobs (tagging, query expansion); defaults to Model
 	AutoTag   bool   `json:"auto_tag"`   // AI-suggest tags on every `mem add`
@@ -53,8 +55,13 @@ const (
 
 var configPath = filepath.Join(home, "config.json")
 
+var loaded *Config
+
 func loadConfig() Config {
-	cfg := Config{Model: defaultModel, ContextBudget: defaultBudget}
+	if loaded != nil {
+		return *loaded
+	}
+	cfg := Config{NotesDir: filepath.Join(home, "notes"), Model: defaultModel, ContextBudget: defaultBudget}
 	if b, err := os.ReadFile(configPath); err == nil {
 		if err := json.Unmarshal(b, &cfg); err != nil {
 			die("bad %s: %v", configPath, err)
@@ -63,9 +70,20 @@ func loadConfig() Config {
 	if m := os.Getenv("MEM_MODEL"); m != "" {
 		cfg.Model = m
 	}
+	if d := os.Getenv("MEM_NOTES"); d != "" {
+		cfg.NotesDir = d
+	}
+	if rest, ok := strings.CutPrefix(cfg.NotesDir, "~/"); ok {
+		h, _ := os.UserHomeDir()
+		cfg.NotesDir = filepath.Join(h, rest)
+	}
+	if abs, err := filepath.Abs(cfg.NotesDir); err == nil {
+		cfg.NotesDir = abs
+	}
 	if cfg.FastModel == "" {
 		cfg.FastModel = cfg.Model
 	}
+	loaded = &cfg
 	return cfg
 }
 
@@ -75,6 +93,8 @@ func writeDefaultConfig() error {
 	}
 	os.MkdirAll(home, 0o755)
 	b, _ := json.MarshalIndent(Config{
+		NotesDir:      filepath.Join(home, "notes"),
+		Inbox:         "",
 		Model:         defaultModel,
 		FastModel:     "",
 		AutoTag:       false,

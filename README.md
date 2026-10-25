@@ -34,7 +34,13 @@ With Go:
 go install github.com/introvert/memcli/cmd/mem@latest
 ```
 
-Optional: `git init ~/.mem` to get version history (and sync) for your notes.
+Point it at your notes folder (optional — default is `~/.mem/notes`):
+
+```sh
+mem config        # creates ~/.mem/config.json; set "notes_dir": "~/code/notes", "inbox": "mem"
+```
+
+Optional: `git init` your notes folder to get version history (and sync) for free.
 
 ### Releasing
 
@@ -68,13 +74,18 @@ can use the same memory. `-m provider/model` picks a model for one run.
 
 ## How it works
 
-- **Notes are plain markdown files** in `~/.mem/notes/` (`$MEM_HOME` to move it), one per note,
-  with a small frontmatter for creation time and tags. They are the source of truth: grep them,
-  edit them, sync them however you like.
+- **Notes are plain markdown files** in any folder you choose — `notes_dir` in the config
+  (default `~/.mem/notes`), e.g. an existing Obsidian vault. Every `.md` file in it is indexed,
+  recursively (hidden folders like `.obsidian` are skipped); new notes go to the `inbox`
+  subfolder with a small frontmatter (`created`, `tags: [a, b]`). Notes are addressed by path,
+  e.g. `mem show Projects/ideas` or just `mem show ideas`. The files are the source of truth:
+  grep them, edit them in Obsidian, sync them however you like.
+- **Config and index** live in `~/.mem` (`$MEM_HOME`), never inside your notes folder.
 - **Search** uses a SQLite FTS5 index (`~/.mem/index.db`) with BM25 ranking — title matches weigh
   most, then tags, then body — plus prefix matching, stemming and accent folding. The index is a
   cache: it refreshes from file mtimes on every run, and deleting it loses nothing.
-- **Git**: if `~/.mem` is a git repo, every add/edit/rm is committed automatically.
+- **Git**: if the notes folder is in a git repo, every add/edit/rm is committed automatically.
+  `rm` moves notes to `.trash/` in the notes folder (the same place Obsidian uses).
 - **`mem ask`** sends all your notes to the model in one call while they fit in `context_budget`
   (best recall). Notes go first, oldest first, so providers' prompt caching reuses that prefix
   between questions. Past the budget it falls back to search, widened with AI-suggested keywords.
@@ -100,6 +111,8 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
 
 ```json
 {
+  "notes_dir": "~/code/notes",
+  "inbox": "mem",
   "model": "deepseek/deepseek-flash",
   "fast_model": "",
   "auto_tag": false,
@@ -116,4 +129,6 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
   (`null` removes a key). Built-in DeepSeek defaults: low reasoning effort for `ask`, thinking off
   for small jobs.
 - Lower `context_budget` (e.g. `20000`) for local models with small context windows.
-- `MEM_MODEL=...` overrides the model for a shell session.
+- `MEM_MODEL=...` / `MEM_NOTES=...` override the model / notes folder for a shell session.
+- Privacy: `mem ask` sends your notes (all of them, while under `context_budget`) to the
+  configured provider. Use a local model (`ollama/...`) if they must not leave your machine.

@@ -15,13 +15,13 @@ import (
 )
 
 var (
-	home      = memHome()
-	notesD    = filepath.Join(home, "notes")
-	trashD    = filepath.Join(home, "trash")
-	dbPath    = filepath.Join(home, "index.db")
-	tagRe     = regexp.MustCompile(`(?:^|\s)#([\p{L}\p{N}_][\p{L}\p{N}_/-]*)`)
-	tokenRe   = regexp.MustCompile(`[\p{L}\p{N}_]+`)
-	numericRe = regexp.MustCompile(`^[0-9]+$`)
+	home   = memHome() // config + index live here (never inside the notes dir)
+	dbPath = filepath.Join(home, "index.db")
+	// Set by setupPaths from config: the notes dir (e.g. an Obsidian vault), where new notes go, and trash.
+	notesD, inboxD, trashD string
+	tagRe                  = regexp.MustCompile(`(?:^|\s)#([\p{L}\p{N}_][\p{L}\p{N}_/-]*)`)
+	tokenRe                = regexp.MustCompile(`[\p{L}\p{N}_]+`)
+	numericRe              = regexp.MustCompile(`^[0-9]+$`)
 )
 
 func memHome() string {
@@ -43,45 +43,110 @@ type Note struct {
 
 // ---------- files (source of truth) ----------
 
+func setupPaths(cfg Config) {
+	notesD = cfg.NotesDir
+	inboxD = filepath.Join(notesD, cfg.Inbox)
+	trashD = filepath.Join(notesD, ".trash") // same folder Obsidian uses
+}
+
+// noteID is the note's path relative to the notes dir, without ".md" (e.g. "Kundix/Crypto/wallets").
+func noteID(path string) string {
+	rel, err := filepath.Rel(notesD, path)
+	if err != nil {
+		rel = filepath.Base(path)
+	}
+	return filepath.ToSlash(strings.TrimSuffix(rel, ".md"))
+}
+
+func notePath(id string) string { return filepath.Join(notesD, filepath.FromSlash(id)+".md") }
+
+// parseNote reads a markdown file, with or without YAML frontmatter (mem's own or Obsidian's).
 func parseNote(path string) (Note, error) {
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return Note{}, err
 	}
-	text, meta := string(b), map[string]string{}
-	if strings.HasPrefix(text, "---\n") {
-		if end := strings.Index(text[4:], "\n---\n"); end != -1 {
-			for _, line := range strings.Split(text[4:4+end], "\n") {
-				k, v, _ := strings.Cut(line, ":")
-				meta[strings.TrimSpace(k)] = strings.TrimSpace(v)
+	text := strings.ReplaceAll(string(b), "\r\n", "\n")
+	meta, tags := map[string]string{}, map[string]bool{}
+	if fm, rest, ok := splitFrontmatter(text); ok {
+		text = rest
+		key := ""
+		for _, line := range strings.Split(fm, "\n") {
+			if item, ok := strings.CutPrefix(strings.TrimSpace(line), "- "); ok && line != strings.TrimLeft(line, " -") {
+				if key == "tags" { // YAML block list: "tags:\n  - a\n  - b"
+					addTagList(tags, item)
+				}
+				continue
 			}
-			text = text[4+end+5:]
+			k, v, _ := strings.Cut(line, ":")
+			key = strings.TrimSpace(k)
+			meta[key] = strings.TrimSpace(v)
 		}
+		addTagList(tags, meta["tags"])
 	}
 	body := strings.TrimSpace(text)
-	tags := map[string]bool{}
-	for _, t := range strings.Split(meta["tags"], ",") {
-		if t = strings.ToLower(strings.TrimSpace(t)); t != "" {
-			tags[t] = true
-		}
-	}
 	for _, m := range tagRe.FindAllStringSubmatch(body, -1) {
 		if !numericRe.MatchString(m[1]) { // "#123" is an issue number, not a tag
 			tags[strings.ToLower(m[1])] = true
 		}
 	}
-	title, _, _ := strings.Cut(body, "\n")
-	if r := []rune(title); len(r) > 120 {
-		title = string(r[:120])
+	created := meta["created"]
+	if created == "" {
+		created = meta["date"]
+	}
+	if created == "" { // plain markdown file: fall back to its modification time
+		if st, err := os.Stat(path); err == nil {
+			created = st.ModTime().Format("2006-01-02T15:04:05")
+		}
 	}
 	return Note{
-		ID: strings.TrimSuffix(filepath.Base(path), ".md"), Created: meta["created"],
-		Tags: sortedKeys(tags), Title: title, Body: body, Path: path,
+		ID: noteID(path), Created: strings.Trim(created, `"'`),
+		Tags: sortedKeys(tags), Title: titleOf(body, path), Body: body, Path: path,
 	}, nil
 }
 
+func splitFrontmatter(text string) (fm, rest string, ok bool) {
+	if !strings.HasPrefix(text, "---\n") {
+		return "", text, false
+	}
+	end := strings.Index(text[4:], "\n---")
+	if end == -1 {
+		return "", text, false
+	}
+	rest = text[4+end+4:]
+	if nl := strings.IndexByte(rest, '\n'); nl != -1 {
+		rest = rest[nl+1:]
+	} else {
+		rest = ""
+	}
+	return text[4 : 4+end], rest, true
+}
+
+// addTagList accepts "a, b", "[a, b]", "a b" and quoted forms.
+func addTagList(set map[string]bool, v string) {
+	v = strings.Trim(strings.TrimSpace(v), "[]")
+	for _, t := range strings.FieldsFunc(v, func(r rune) bool { return r == ',' || r == ' ' }) {
+		if t = strings.ToLower(strings.Trim(t, `"'#`)); t != "" {
+			set[t] = true
+		}
+	}
+}
+
+// titleOf is the first non-empty line without markdown heading marks, or the file name.
+func titleOf(body, path string) string {
+	for _, line := range strings.Split(body, "\n") {
+		if line = strings.TrimSpace(strings.TrimLeft(line, "# ")); line != "" {
+			if r := []rune(line); len(r) > 120 {
+				line = string(r[:120])
+			}
+			return line
+		}
+	}
+	return strings.TrimSuffix(filepath.Base(path), ".md")
+}
+
 func writeNote(body string, tags []string) (string, error) {
-	if err := os.MkdirAll(notesD, 0o755); err != nil {
+	if err := os.MkdirAll(inboxD, 0o755); err != nil {
 		return "", err
 	}
 	now := time.Now()
@@ -93,14 +158,15 @@ func writeNote(body string, tags []string) (string, error) {
 		}
 	}
 	content := fmt.Sprintf("---\ncreated: %s\ntags: %s\n---\n%s\n",
-		now.Format("2006-01-02T15:04:05"), strings.Join(sortedKeys(set), ", "), strings.TrimSpace(body))
+		now.Format("2006-01-02T15:04:05"), yamlList(sortedKeys(set)), strings.TrimSpace(body))
 	// O_EXCL: never clobber a note another mem process created in the same second; take the next id.
 	for n := 1; ; n++ {
-		id := base
+		name := base
 		if n > 1 {
-			id = fmt.Sprintf("%s-%d", base, n)
+			name = fmt.Sprintf("%s-%d", base, n)
 		}
-		f, err := os.OpenFile(filepath.Join(notesD, id+".md"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
+		path := filepath.Join(inboxD, name+".md")
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o644)
 		if os.IsExist(err) {
 			continue
 		}
@@ -109,57 +175,85 @@ func writeNote(body string, tags []string) (string, error) {
 		}
 		defer f.Close()
 		_, err = f.WriteString(content)
-		return id, err
+		return noteID(path), err
 	}
 }
 
-// addTags rewrites a note's frontmatter tags line to include extra tags.
+// yamlList renders tags as a YAML flow list, which Obsidian reads as tags.
+func yamlList(tags []string) string { return "[" + strings.Join(tags, ", ") + "]" }
+
+// addTags rewrites a note's single-line frontmatter "tags:" entry to include extra tags.
 func addTags(id string, extra []string) error {
-	path := filepath.Join(notesD, id+".md")
+	path := notePath(id)
 	b, err := os.ReadFile(path)
 	if err != nil {
 		return err
 	}
 	text := string(b)
+	fm, _, ok := splitFrontmatter(text)
 	start := strings.Index(text, "\ntags:")
-	if !strings.HasPrefix(text, "---\n") || start == -1 {
-		return fmt.Errorf("note %s has no tags line", id)
+	if !ok || start == -1 || start > len(fm)+4 {
+		return fmt.Errorf("note %s has no frontmatter tags line", id)
 	}
 	end := start + 1 + strings.Index(text[start+1:], "\n")
 	set := map[string]bool{}
-	for _, t := range append(strings.Split(text[start+7:end], ","), extra...) {
-		if t = strings.ToLower(strings.TrimLeft(strings.TrimSpace(t), "#")); t != "" {
-			set[t] = true
-		}
+	addTagList(set, text[start+7:end])
+	for _, t := range extra {
+		addTagList(set, t)
 	}
-	text = text[:start] + "\ntags: " + strings.Join(sortedKeys(set), ", ") + text[end:]
+	text = text[:start] + "\ntags: " + yamlList(sortedKeys(set)) + text[end:]
 	return os.WriteFile(path, []byte(text), 0o644)
 }
 
-func resolve(prefix string) (string, error) {
-	hits, _ := filepath.Glob(filepath.Join(notesD, prefix+"*.md"))
-	sort.Strings(hits)
-	switch {
-	case len(hits) == 0:
-		return "", fmt.Errorf("no note matching '%s'", prefix)
-	case len(hits) > 1:
-		ids := []string{}
-		for i, h := range hits {
-			if i == 8 {
-				break
-			}
-			ids = append(ids, strings.TrimSuffix(filepath.Base(h), ".md"))
-		}
-		return "", fmt.Errorf("'%s' is ambiguous: %s", prefix, strings.Join(ids, ", "))
+// resolve finds a note by id or file name, exact match first, then by prefix (case-insensitive).
+func resolve(db *sql.DB, q string) (string, error) {
+	rows, err := db.Query("SELECT id FROM files")
+	if err != nil {
+		return "", err
 	}
-	return hits[0], nil
+	var ids []string
+	for rows.Next() {
+		var id string
+		rows.Scan(&id)
+		ids = append(ids, id)
+	}
+	rows.Close()
+	sort.Strings(ids)
+	lq := strings.ToLower(strings.TrimSuffix(q, ".md"))
+	base := func(id string) string { return strings.ToLower(id[strings.LastIndex(id, "/")+1:]) }
+	tests := []func(string) bool{
+		func(id string) bool { return strings.ToLower(id) == lq },
+		func(id string) bool { return base(id) == lq },
+		func(id string) bool { return strings.HasPrefix(strings.ToLower(id), lq) },
+		func(id string) bool { return strings.HasPrefix(base(id), lq) },
+	}
+	for _, match := range tests {
+		var hits []string
+		for _, id := range ids {
+			if match(id) {
+				hits = append(hits, id)
+			}
+		}
+		switch {
+		case len(hits) == 1:
+			return notePath(hits[0]), nil
+		case len(hits) > 1:
+			if len(hits) > 8 {
+				hits = append(hits[:8], "…")
+			}
+			return "", fmt.Errorf("'%s' is ambiguous: %s", q, strings.Join(hits, ", "))
+		}
+	}
+	return "", fmt.Errorf("no note matching '%s'", q)
 }
 
+// gitCommit commits changes under the notes dir, if it is inside a git repo.
 func gitCommit(msg string) {
-	if exists(filepath.Join(home, ".git")) {
-		exec.Command("git", "-C", home, "add", "-A").Run()
-		exec.Command("git", "-C", home, "commit", "-qm", msg).Run()
+	if exec.Command("git", "-C", notesD, "rev-parse", "--is-inside-work-tree").Run() != nil {
+		return
 	}
+	exec.Command("git", "-C", notesD, "add", "-A", "--", ".").Run()
+	exec.Command("git", "-C", notesD, "commit", "-qm", msg, "--", ".").Run()
 }
 
 // ---------- index (disposable cache over the files) ----------
@@ -174,6 +268,7 @@ func openIndex() (*sql.DB, error) {
 		return nil, err
 	}
 	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 		CREATE TABLE IF NOT EXISTS files(id TEXT PRIMARY KEY, mtime INTEGER);
 		CREATE VIRTUAL TABLE IF NOT EXISTS fts USING fts5(
 			id UNINDEXED, created UNINDEXED, title, body, tags,
@@ -181,16 +276,37 @@ func openIndex() (*sql.DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The index belongs to one notes dir; if the config points elsewhere now, start over.
+	var dir string
+	db.QueryRow("SELECT v FROM meta WHERE k='notes_dir'").Scan(&dir)
+	if dir != notesD {
+		db.Exec("DELETE FROM files; DELETE FROM fts;")
+		db.Exec("INSERT OR REPLACE INTO meta VALUES('notes_dir', ?)", notesD)
+	}
 	return db, syncIndex(db)
+}
+
+// walkNotes lists every .md file under the notes dir, skipping hidden folders (.obsidian, .trash, .git…).
+func walkNotes() map[string]string {
+	found := map[string]string{}
+	filepath.WalkDir(notesD, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() && p != notesD && strings.HasPrefix(d.Name(), ".") {
+			return filepath.SkipDir
+		}
+		if !d.IsDir() && strings.HasSuffix(d.Name(), ".md") && !strings.HasPrefix(d.Name(), ".") {
+			found[noteID(p)] = p
+		}
+		return nil
+	})
+	return found
 }
 
 // syncIndex brings the index up to date with the files on disk (cheap: mtime check).
 func syncIndex(db *sql.DB) error {
-	onDisk := map[string]string{}
-	paths, _ := filepath.Glob(filepath.Join(notesD, "*.md"))
-	for _, p := range paths {
-		onDisk[strings.TrimSuffix(filepath.Base(p), ".md")] = p
-	}
+	onDisk := walkNotes()
 	known := map[string]int64{}
 	rows, err := db.Query("SELECT id, mtime FROM files")
 	if err != nil {
@@ -346,7 +462,7 @@ func sortedKeys(m map[string]bool) []string {
 	return out
 }
 
-// idOrder sorts ids chronologically: by timestamp, then numerically by the -N suffix (so -10 follows -9).
+// idOrder sorts notes chronologically; ties (same second) by id length then id, so "-10" follows "-9".
 func idOrder(dir string) string {
-	return fmt.Sprintf("substr(id, 1, 13) %[1]s, length(id) %[1]s, id %[1]s", dir)
+	return fmt.Sprintf("created %[1]s, length(id) %[1]s, id %[1]s", dir)
 }

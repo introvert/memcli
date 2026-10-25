@@ -34,7 +34,8 @@ const usage = `mem — tiny personal memory
   mem path | reindex              storage dir | rebuild index
 
 Flags: --json (s/ls/show/ask) machine-readable output · -m provider/model (ask/add) pick a model
-Storage: $MEM_HOME (default ~/.mem). If it is a git repo, every change is auto-committed.
+Notes: notes_dir in config (or $MEM_NOTES), any folder of .md files incl. Obsidian vaults.
+Config + index: $MEM_HOME (default ~/.mem). If the notes dir is in a git repo, changes are auto-committed.
 Models: deepseek/deepseek-flash (default), anthropic/claude-opus-5-5, openai/<m>, gemini/<m>, ollama/<m>, openrouter/<m>, groq/<m>, ...`
 
 var version = "dev" // set at release build time: -ldflags "-X main.version=v1.2.3"
@@ -42,6 +43,7 @@ var version = "dev" // set at release build time: -ldflags "-X main.version=v1.2
 var color = isTTY(os.Stdout) && os.Getenv("NO_COLOR") == ""
 
 func main() {
+	setupPaths(loadConfig())
 	args := os.Args[1:]
 	if len(args) == 0 {
 		if piped() {
@@ -55,7 +57,7 @@ func main() {
 		"add": cmdAdd, "s": cmdSearch, "search": cmdSearch, "ask": cmdAsk,
 		"ls": cmdLs, "show": cmdShow, "cat": cmdShow, "edit": cmdEdit, "rm": cmdRm,
 		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex,
-		"path": func([]string) { fmt.Println(home) },
+		"path": func([]string) { fmt.Println(notesD) },
 	}
 	switch args[0] {
 	case "-h", "--help", "help":
@@ -296,8 +298,10 @@ func cmdShow(args []string) {
 	if len(o.pos) == 0 {
 		die("usage: mem show ID")
 	}
+	db, err := openIndex()
+	check(err)
 	for _, p := range o.pos {
-		path, err := resolve(p)
+		path, err := resolve(db, p)
 		check(err)
 		n, err := parseNote(path)
 		check(err)
@@ -314,10 +318,12 @@ func cmdEdit(args []string) {
 	if len(args) == 0 {
 		die("usage: mem edit ID")
 	}
-	path, err := resolve(args[0])
+	db, err := openIndex()
+	check(err)
+	path, err := resolve(db, args[0])
 	check(err)
 	runEditor(path)
-	gitCommit("edit " + filepath.Base(path))
+	gitCommit("edit " + noteID(path))
 }
 
 func cmdRm(args []string) {
@@ -325,11 +331,18 @@ func cmdRm(args []string) {
 		die("usage: mem rm ID")
 	}
 	check(os.MkdirAll(trashD, 0o755))
+	db, err := openIndex()
+	check(err)
 	for _, a := range args {
-		path, err := resolve(a)
+		path, err := resolve(db, a)
 		check(err)
-		check(os.Rename(path, filepath.Join(trashD, filepath.Base(path))))
-		fmt.Println(c("31", "trashed ") + strings.TrimSuffix(filepath.Base(path), ".md"))
+		id := noteID(path)
+		dest := filepath.Join(trashD, strings.ReplaceAll(id, "/", "__")+".md")
+		if exists(dest) {
+			dest = strings.TrimSuffix(dest, ".md") + time.Now().Format("-060102-150405") + ".md"
+		}
+		check(os.Rename(path, dest))
+		fmt.Println(c("31", "trashed ") + id)
 	}
 	gitCommit("rm " + strings.Join(args, " "))
 }
@@ -348,6 +361,7 @@ func cmdConfig([]string) {
 	check(writeDefaultConfig())
 	cfg := loadConfig()
 	fmt.Println("config:     " + configPath)
+	fmt.Println("notes_dir:  " + notesD + c("2", "   (new notes → "+inboxD+")"))
 	fmt.Println("model:      " + cfg.Model + c("2", "   (mem ask)"))
 	fmt.Println("fast_model: " + cfg.FastModel + c("2", "   (tagging, query expansion)"))
 	fmt.Printf("auto_tag:   %v\n", cfg.AutoTag)
