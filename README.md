@@ -1,25 +1,28 @@
 # memcli
 
-`mem` — a tiny personal memory for the terminal. Push notes in a second, find them later
-with full-text search, or just ask in plain language and let an AI answer from your notes.
+**Jot a note in one second, then find it or ask about it in plain language later.**
+
+| Search your notes | Ask, then copy or run the answer |
+|---|---|
+| ![search](docs/mac-search.png) | ![answer](docs/mac-answer.png) |
+
+- **Instant capture:** `mem buy oat milk #todo` in the terminal, or ⌃⌥M → `+` from any app.
+- **Find anything:** ranked search that forgives typos, across any folder of Markdown (Obsidian vaults too).
+- **Ask in plain language:** an AI reads your notes and answers with sources ("what's my adidas account id?").
+- **Act on the answer:** copy a value or run a command in one keystroke.
+- **Secrets stay private:** passwords, tokens and keys are hidden before anything reaches the AI, and filled in only on your machine when you copy or run.
+- **Your files, any model:** plain `.md` files you own; DeepSeek by default, or Claude, OpenAI, Gemini, Ollama and others.
 
 ```
 $ mem "staging db: pg-staging.internal:5432, user app_ro #work #infra"
-saved 261025-235030
+saved mem/261025-235030
 $ mem s staging
-261025-235030  2026-10-25  staging db: pg-staging.internal:5432, user app_ro  #infra #work
-$ mem ask "what are the staging db credentials?"
-· search "staging database" → 2
-· read mem/261025-235030
-Host pg-staging.internal:5432, user app_ro [mem/261025-235030]. The password is redacted;
-run: mem show mem/261025-235030
-
-sources:
-  mem/261025-235030  staging db: pg-staging.internal:5432, user app_ro
+mem/261025-235030  2026-10-25  staging db: pg-staging.internal:5432, user app_ro  #infra #work
+$ mem ask "staging db host?"
+pg-staging.internal:5432, user app_ro [mem/261025-235030]
+  1  copy  pg-staging.internal:5432
+  1 · a copy answer · o open mem/261025-235030 · f follow-up · ⏎ done
 ```
-
-(Illustrative output.) `ask` runs a small agent that searches, greps and reads your notes —
-and a privacy filter makes sure passwords, tokens and keys never reach the model.
 
 ## Install
 
@@ -199,9 +202,8 @@ app) and shares the same notes, index, config and keys.
 
 Build and install: `mac/build.sh --install` (needs Xcode command line tools and Go).
 
-| Search (secrets masked) | AI answer with actions |
+| Recent notes | Run a command (secret filled in locally) |
 |---|---|
-| ![search](docs/mac-search.png) | ![answer](docs/mac-answer.png) |
 | ![recent notes](docs/mac-recent.png) | ![run a command](docs/mac-run.png) |
 
-Screenshots use a demo vault; the password is never shown, and is filled in only when copied or run.
+Screenshots use a demo vault.
