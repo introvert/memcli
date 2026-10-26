@@ -12,6 +12,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 
 	"golang.org/x/term"
 )
@@ -35,15 +36,19 @@ func envOr(k, def string) string {
 
 type keyResult struct{ key, source string }
 
-var keyCache = map[string]keyResult{} // one keychain lookup per provider per run
+var keyMu sync.Mutex
+
+var keyCache = map[string]keyResult{} // one keychain lookup per provider per run (found keys only)
 
 // apiKey finds the key for a provider; source says where it came from ("" = not found).
 func apiKey(p Provider) (key, source string, err error) {
+	keyMu.Lock() // `mem serve` handles requests concurrently
+	defer keyMu.Unlock()
 	if r, ok := keyCache[p.Name]; ok {
 		return r.key, r.source, nil
 	}
 	key, source, err = lookupKey(p)
-	if err == nil {
+	if err == nil && key != "" { // never cache "not found": `mem serve` lives on after `mem key set`
 		keyCache[p.Name] = keyResult{key, source}
 	}
 	return key, source, err
