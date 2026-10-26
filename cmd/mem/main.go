@@ -237,8 +237,10 @@ func cmdAsk(args []string) {
 		printJSON(res)
 		return
 	}
-	printSources(res.Sources)
 	interactive := isTTY(os.Stdout) && isTTY(os.Stdin) && !o.flags["-q"] && (cfg.Actions == nil || *cfg.Actions)
+	if !interactive || len(res.Sources) > 1 { // with one source, the menu's "o open <id>" names it
+		printSources(res.Sources)
+	}
 	if interactive {
 		actionMenu(sess, res)
 	}

@@ -177,7 +177,9 @@ func actionMenu(s *session, res askResult) {
 				warn("%v", err)
 				continue
 			}
-			printSources(next.Sources)
+			if len(next.Sources) > 1 {
+				printSources(next.Sources)
+			}
 			res, listed = next, false
 		default: // Enter, q, Esc, Ctrl-C, anything else
 			return

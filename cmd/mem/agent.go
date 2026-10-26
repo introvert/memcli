@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"path"
 	"regexp"
 	"sort"
@@ -137,20 +138,22 @@ func (s *session) ask(ctx context.Context, question string, out io.Writer) (askR
 	}
 	// Run the obvious search locally (milliseconds) and hand over the results up front, so most
 	// questions are answered in a single model call instead of search → read → answer round trips.
+	st := newStatus(s.progress, out)
+	st.set("searching notes…")
 	pre, hits, fixed := s.prefetch(question)
 	user += "\n\n" + pre
-	if s.progress != nil {
-		note := ""
-		if fixed {
-			note = " (corrected typos)"
-		}
-		if len(hits) == 0 {
-			fmt.Fprintln(s.progress, c("2", "· no matching notes, searching further…"+note))
-		} else {
-			fmt.Fprintln(s.progress, c("2", fmt.Sprintf("· %d notes matched%s", len(hits), note)))
-		}
+	note := ""
+	if fixed {
+		note = " (corrected typos)"
 	}
-	rw := newRender(out)
+	_, model, _ := s.cfg.resolveModel(s.spec)
+	if len(hits) == 0 {
+		st.set("no direct matches" + note + " · asking " + model + "…")
+	} else {
+		st.set(fmt.Sprintf("%d notes matched%s · asking %s…", len(hits), note, model))
+	}
+	defer st.clear()
+	rw := newRender(st.wrap(out))
 	flush := func() {
 		if r, ok := rw.(*render); ok {
 			r.Flush()
@@ -183,9 +186,7 @@ func (s *session) ask(ctx context.Context, question string, out io.Writer) (askR
 			results[i] = o
 			line := call.Name + " " + summary
 			res.Steps = append(res.Steps, line)
-			if s.progress != nil {
-				fmt.Fprintln(s.progress, c("2", "· "+line))
-			}
+			st.set(line)
 		}
 		s.chat.AddResults(calls, results)
 	}
@@ -531,3 +532,52 @@ func orEmptyJSON(s string) string {
 	}
 	return s
 }
+
+// status shows progress on one line of stderr that updates in place and disappears as soon as the
+// answer starts, so the screen ends up showing just the answer. When stderr or stdout isn't a
+// terminal (logs, pipes), each step is printed on its own line instead.
+type status struct {
+	w     io.Writer
+	live  bool
+	shown bool
+}
+
+func newStatus(progress, out io.Writer) *status {
+	if progress == nil {
+		return &status{}
+	}
+	return &status{w: progress, live: isTTY(os.Stderr) && out == os.Stdout && isTTY(os.Stdout)}
+}
+
+func (st *status) set(line string) {
+	switch {
+	case st.w == nil:
+	case st.live:
+		fmt.Fprint(st.w, "\r\x1b[K"+c("2", "· "+clip(line, 100)))
+		st.shown = true
+	default:
+		fmt.Fprintln(st.w, c("2", "· "+line))
+	}
+}
+
+func (st *status) clear() {
+	if st.live && st.shown {
+		fmt.Fprint(st.w, "\r\x1b[K")
+		st.shown = false
+	}
+}
+
+// wrap returns a writer that clears the status line before the first answer text appears.
+func (st *status) wrap(w io.Writer) io.Writer {
+	if w == nil || !st.live {
+		return w
+	}
+	return writerFunc(func(p []byte) (int, error) {
+		st.clear()
+		return w.Write(p)
+	})
+}
+
+type writerFunc func([]byte) (int, error)
+
+func (f writerFunc) Write(p []byte) (int, error) { return f(p) }
