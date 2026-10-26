@@ -1,0 +1,14 @@
+{
+  "manifest_version": 3,
+  "name": "mem",
+  "description": "Save notes, search them and ask about them — your personal memory (mem).",
+  "version": "0.4.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAjkQM6JYhFyJcbVC6fJz0OUdF3xVUV68sCMZTiz+ysDBtfUnc8EOqHGg64luwRF7+FaO35HEx5tm/cJZQxU375+Ml6nwpI039HteC4CvchJZOZ28nTJIfuQEn2QVnkphFIo6LqwSAwoM9KNlyfs9WHNsfznyAPiTgJaIxg4eGdt6CWDn/K1IWz0fitiU0AXJtbjJUI9qyLFuEacMtcv4xeO9cHwSaVKKEXvXzuacR0Ulw3uWhhJ7pWCZSxDalDSn8w1rtxZijRkfWtpp8PQ+m/O3pmHGkGq7IEWyF2FBLU2pUDiu+E+bECvQoJfP5Q25LWeICWSc61YZC39VbR5l21QIDAQAB",
+  "permissions": ["nativeMessaging", "contextMenus", "activeTab", "scripting"],
+  "background": { "service_worker": "background.js" },
+  "action": { "default_popup": "popup.html", "default_title": "mem" },
+  "commands": {
+    "_execute_action": { "suggested_key": { "default": "Alt+Shift+M" }, "description": "Open mem" }
+  },
+  "icons": { "16": "icons/icon16.png", "32": "icons/icon32.png", "48": "icons/icon48.png", "128": "icons/icon128.png" }
+}

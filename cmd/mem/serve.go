@@ -2,6 +2,7 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -52,11 +53,12 @@ type uiItem struct {
 }
 
 type server struct {
-	db  *sql.DB
-	cfg Config
-	out *json.Encoder
-	wmu sync.Mutex // serializes writes to stdout
-	imu sync.Mutex // serializes index syncs
+	db       *sql.DB
+	cfg      Config
+	write    func([]byte) // one encoded event to the client
+	wmu      sync.Mutex   // serializes writes
+	allowRun bool         // whether "item run" may run commands (not for the browser extension)
+	imu      sync.Mutex   // serializes index syncs
 
 	run    sync.Mutex // one ask at a time
 	amu    sync.Mutex // guards the fields below
@@ -66,35 +68,48 @@ type server struct {
 }
 
 func cmdServe([]string) {
+	s := newServer(func(b []byte) { os.Stdout.Write(append(b, '\n')) })
+	s.allowRun = true
+	sc := bufio.NewScanner(os.Stdin)
+	sc.Buffer(make([]byte, 1<<20), 16<<20)
+	for sc.Scan() {
+		s.dispatch(sc.Bytes())
+	}
+}
+
+func newServer(write func([]byte)) *server {
 	color = false
 	cfg := loadConfig()
 	db, err := openIndex()
 	check(err)
-	s := &server{db: db, cfg: cfg, out: json.NewEncoder(os.Stdout)}
-	s.out.SetEscapeHTML(false)
+	s := &server{db: db, cfg: cfg, write: write}
 	warmUp(cfg, cfg.Model)
 	s.send(0, event{"ev": "ready", "version": version, "notes_dir": notesD, "model": cfg.Model})
-	sc := bufio.NewScanner(os.Stdin)
-	sc.Buffer(make([]byte, 1<<20), 16<<20)
-	for sc.Scan() {
-		var r request
-		if err := json.Unmarshal(sc.Bytes(), &r); err != nil {
-			s.send(0, event{"ev": "error", "text": "bad request: " + err.Error()})
-			continue
-		}
-		if r.Op == "cancel" || r.Op == "reset" {
-			s.handle(r) // in order: must not overtake the request sent after it
-		} else {
-			go s.handle(r)
-		}
+	return s
+}
+
+func (s *server) dispatch(line []byte) {
+	var r request
+	if err := json.Unmarshal(line, &r); err != nil {
+		s.send(0, event{"ev": "error", "text": "bad request: " + err.Error()})
+		return
+	}
+	if r.Op == "cancel" || r.Op == "reset" {
+		s.handle(r) // in order: must not overtake the request sent after it
+	} else {
+		go s.handle(r)
 	}
 }
 
 func (s *server) send(id int, e event) {
 	e["id"] = id
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.Encode(e)
 	s.wmu.Lock()
 	defer s.wmu.Unlock()
-	s.out.Encode(e)
+	s.write(bytes.TrimRight(buf.Bytes(), "\n"))
 }
 
 func (s *server) fail(id int, err error) { s.send(id, event{"ev": "error", "text": err.Error()}) }
@@ -279,6 +294,8 @@ func (s *server) item(r request) {
 			return
 		}
 		s.report(r.ID, copyText(v, true), fmt.Sprintf("copied secret from %s · clears in %ds", note, int(clipClearAfter.Seconds())))
+	case r.Action == "run" && !s.allowRun:
+		s.send(r.ID, event{"ev": "error", "text": "running commands is not available here"})
 	case r.Action == "run":
 		cmd, _, err := sess.fill(it.text)
 		if err != nil {

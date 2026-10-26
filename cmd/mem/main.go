@@ -31,6 +31,7 @@ const usage = `mem — tiny personal memory
                                   agent does it in Chrome, using your notes; asks before sending anything;
                                   logs every run (note in <inbox>/runs, #do #log)
   mem browser [site]              open mem's Chrome to log in to sites mem do should use
+  mem extension                   set up the Chrome extension: save pages/selections, search, ask
   mem secrets                     what the privacy filter hides from AI (values masked)
   mem key set deepseek            store an API key in the OS keychain (mem key ls / rm)
   mem ls [-n 20] [-t todo]        recent notes
@@ -53,6 +54,10 @@ var color = isTTY(os.Stdout) && os.Getenv("NO_COLOR") == ""
 func main() {
 	setupPaths(loadConfig())
 	args := os.Args[1:]
+	if len(args) > 0 && strings.HasPrefix(args[0], "chrome-extension://") { // started by Chrome for the extension
+		cmdNative(args)
+		return
+	}
 	if len(args) == 0 {
 		if piped() {
 			cmdAdd(nil)
@@ -64,7 +69,7 @@ func main() {
 	cmds := map[string]func([]string){
 		"add": cmdAdd, "s": cmdSearch, "search": cmdSearch, "ask": cmdAsk,
 		"ls": cmdLs, "show": cmdShow, "cat": cmdShow, "edit": cmdEdit, "rm": cmdRm,
-		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets, "key": cmdKey, "serve": cmdServe, "do": cmdDo, "browser": cmdBrowser, "__clipclear": cmdClipClear,
+		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets, "key": cmdKey, "serve": cmdServe, "do": cmdDo, "browser": cmdBrowser, "extension": cmdExtension, "__clipclear": cmdClipClear,
 		"path": func([]string) { fmt.Println(notesD) },
 	}
 	switch args[0] {

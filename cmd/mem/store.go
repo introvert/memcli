@@ -191,7 +191,7 @@ func titleOf(body, path string) string {
 		if strings.HasPrefix(strings.TrimSpace(line), "```") {
 			continue // code fence markers aren't titles
 		}
-		if line = strings.TrimSpace(strings.TrimLeft(line, "# ")); line != "" {
+		if line = strings.TrimSpace(strings.TrimLeft(line, "#> ")); line != "" {
 			if r := []rune(line); len(r) > 120 {
 				line = string(r[:120])
 			}

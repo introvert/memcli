@@ -1,0 +1,23 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<link rel="stylesheet" href="popup.css">
+</head>
+<body>
+  <section id="save">
+    <textarea id="note" rows="4" placeholder="Write a note… #tags work · ⌘↩ saves"></textarea>
+    <div class="row">
+      <label class="link"><input type="checkbox" id="withLink" checked> <span id="pageTitle">this page</span></label>
+      <button id="saveBtn">Save</button>
+    </div>
+  </section>
+  <section id="find">
+    <input id="q" placeholder="Search notes · ?question asks AI" autocomplete="off">
+    <div id="answer" hidden></div>
+    <ul id="results"></ul>
+  </section>
+  <div id="status"></div>
+  <script src="popup.js"></script>
+</body>
+</html>

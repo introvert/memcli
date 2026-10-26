@@ -190,6 +190,19 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
 - Privacy: the agent sends the model only what its tools return, after redaction. Use a local
   model (`ollama/...`) if even redacted notes must not leave your machine.
 
+## Chrome extension
+
+```sh
+mem extension      # registers mem with Chrome/Brave/Edge/Arc, then: chrome://extensions →
+                   # Developer mode → Load unpacked → ~/.mem/extension
+```
+
+- **⌥⇧M** (or the toolbar icon): write a note — the selected text is quoted in, the page link added — and
+  `⌘↩` saves it. Below: search your notes, or `?question` to ask the AI.
+- **Right-click → Save selection / link / page to mem** saves in one click (tagged `#web`).
+- It talks to the `mem` on your machine through Chrome's native messaging: no server, no port, nothing
+  leaves your computer except AI questions. Only this extension may start `mem`, and it can't run commands.
+
 ## Doing things on the web: `mem do`
 
 ```sh
