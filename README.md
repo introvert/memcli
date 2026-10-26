@@ -198,3 +198,10 @@ app) and shares the same notes, index, config and keys.
 - `+text` or `⌘S` save as a note · `esc` back / close
 
 Build and install: `mac/build.sh --install` (needs Xcode command line tools and Go).
+
+| Search (secrets masked) | AI answer with actions |
+|---|---|
+| ![search](docs/mac-search.png) | ![answer](docs/mac-answer.png) |
+| ![recent notes](docs/mac-recent.png) | ![run a command](docs/mac-run.png) |
+
+Screenshots use a demo vault; the password is never shown, and is filled in only when copied or run.
