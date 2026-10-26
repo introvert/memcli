@@ -46,6 +46,22 @@ type Chat interface {
 	AddUser(text string)
 }
 
+// compactor is implemented by chats that can shrink old tool results, so long tool loops (the
+// browser agent sees a whole page per step) don't outgrow the context window.
+type compactor interface {
+	// Compact cuts every tool result except the last keep to its first head bytes plus a note.
+	Compact(keep, head int)
+}
+
+const compactNote = "\n[older page state omitted]"
+
+func cut(s string, head int) string {
+	if len(s) <= head+len(compactNote) || strings.HasSuffix(s, compactNote) {
+		return s
+	}
+	return clip(s, head) + compactNote
+}
+
 func newChat(cfg Config, spec, system, user string, tools []Tool, level Level) (Chat, error) {
 	p, model, err := cfg.resolveModel(spec)
 	if err != nil {
@@ -194,6 +210,23 @@ func (c *claudeChat) AddResults(calls []ToolCall, results []string) {
 	c.params.Messages = append(c.params.Messages, anthropic.NewBetaUserMessage(blocks...))
 }
 
+func (c *claudeChat) Compact(keep, head int) {
+	seen := 0
+	for i := len(c.params.Messages) - 1; i >= 0; i-- {
+		for _, b := range c.params.Messages[i].Content {
+			if tr := b.OfToolResult; tr != nil {
+				if seen++; seen > keep {
+					for _, part := range tr.Content {
+						if part.OfText != nil {
+							part.OfText.Text = cut(part.OfText.Text, head)
+						}
+					}
+				}
+			}
+		}
+	}
+}
+
 // ---------- everything else (OpenAI-compatible chat completions) ----------
 
 type openaiChat struct {
@@ -332,6 +365,19 @@ func (o *openaiChat) AddUser(text string) {
 func (o *openaiChat) AddResults(calls []ToolCall, results []string) {
 	for i, call := range calls {
 		o.msgs = append(o.msgs, map[string]any{"role": "tool", "tool_call_id": call.ID, "content": results[i]})
+	}
+}
+
+func (o *openaiChat) Compact(keep, head int) {
+	seen := 0
+	for i := len(o.msgs) - 1; i >= 0; i-- {
+		if o.msgs[i]["role"] == "tool" {
+			if seen++; seen > keep {
+				if c, ok := o.msgs[i]["content"].(string); ok {
+					o.msgs[i]["content"] = cut(c, head)
+				}
+			}
+		}
 	}
 }
 

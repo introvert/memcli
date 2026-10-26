@@ -190,6 +190,30 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
 - Privacy: the agent sends the model only what its tools return, after redaction. Use a local
   model (`ollama/...`) if even redacted notes must not leave your machine.
 
+## Doing things on the web: `mem do`
+
+```sh
+mem browser                       # once: opens mem's Chrome; log in to sites you want it to use
+mem do "contact rainproxy about a large-scale plan"
+```
+
+An agent drives a visible Chrome window: it finds the site, the contact or pricing page, fills
+in forms and writes the message, taking facts about you (name, email, company, earlier contact)
+from your notes, or asking you when something is missing.
+
+- **Nothing is sent without you.** Clicking anything that sends, submits, buys, deletes or signs up,
+  and pressing Enter in a form, stops and shows exactly what will go out: `y` sends, `n` stops,
+  `e` stops and tells the agent why.
+- **Secrets stay local.** The model sees passwords only as `[REDACTED:…]`; the real value is typed
+  into the page on your machine and masked in everything read back. Page text is redacted too.
+- **Web pages can't give it orders.** Page text is treated as data; the confirmation step is the
+  safety net either way.
+- **Every run is logged.** Each step goes to `~/.mem/runs/<time>.jsonl`, and a summary note with what
+  was sent lands in `<inbox>/runs/` tagged `#do #log`, so `mem ask "what did I send rainproxy?"` works.
+
+Chrome runs with its own profile in `~/.mem/chrome` (Chrome won't allow remote control of your
+everyday profile), so you log in there once. `MEM_CHROME` picks another Chromium browser.
+
 ## macOS menu bar app
 
 `mac/` holds a small native app: a brain icon in the menu bar plus a Spotlight-style panel on a

@@ -27,6 +27,10 @@ const usage = `mem — tiny personal memory
   mem ask -d "..."                same, with deep thinking for hard questions (slower)
                                   after an answer: 1-9 copy/run · a copy answer · o open note · f follow-up
                                   (-q: no menu)
+  mem do "contact rainproxy about a large-scale plan"
+                                  agent does it in Chrome, using your notes; asks before sending anything;
+                                  logs every run (note in <inbox>/runs, #do #log)
+  mem browser [site]              open mem's Chrome to log in to sites mem do should use
   mem secrets                     what the privacy filter hides from AI (values masked)
   mem key set deepseek            store an API key in the OS keychain (mem key ls / rm)
   mem ls [-n 20] [-t todo]        recent notes
@@ -60,7 +64,7 @@ func main() {
 	cmds := map[string]func([]string){
 		"add": cmdAdd, "s": cmdSearch, "search": cmdSearch, "ask": cmdAsk,
 		"ls": cmdLs, "show": cmdShow, "cat": cmdShow, "edit": cmdEdit, "rm": cmdRm,
-		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets, "key": cmdKey, "serve": cmdServe, "__clipclear": cmdClipClear,
+		"tags": cmdTags, "config": cmdConfig, "reindex": cmdReindex, "secrets": cmdSecrets, "key": cmdKey, "serve": cmdServe, "do": cmdDo, "browser": cmdBrowser, "__clipclear": cmdClipClear,
 		"path": func([]string) { fmt.Println(notesD) },
 	}
 	switch args[0] {
