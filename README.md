@@ -186,3 +186,15 @@ chat completions API, so any compatible server can be added in `~/.mem/config.js
 - `MEM_MODEL=...` / `MEM_NOTES=...` override the model / notes folder for a shell session.
 - Privacy: the agent sends the model only what its tools return, after redaction. Use a local
   model (`ollama/...`) if even redacted notes must not leave your machine.
+
+## macOS menu bar app
+
+`mac/` holds a small native app: a brain icon in the menu bar plus a Spotlight-style panel on a
+global shortcut (default **⌃⌥M**, changeable from the menu). It runs `mem serve` (bundled inside the
+app) and shares the same notes, index, config and keys.
+
+- type to search · `↩` open (Obsidian if the folder is a vault) · `⇧⌘C` copy note
+- `?question` or `⌘↩` ask AI · `⇧⌘↩` deep · `↩` follow-up · `⌘1–9` copy/run · `⇧⌘C` copy answer
+- `+text` or `⌘S` save as a note · `esc` back / close
+
+Build and install: `mac/build.sh --install` (needs Xcode command line tools and Go).
