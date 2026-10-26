@@ -28,7 +28,7 @@ const usage = `mem — tiny personal memory
                                   after an answer: 1-9 copy/run · a copy answer · o open note · f follow-up
                                   (-q: no menu)
   mem do "contact rainproxy about a large-scale plan"
-                                  agent does it in Chrome, using your notes; asks before sending anything;
+                                  agent does it in your Chrome (extension) or its own (--profile), using notes; asks before sending;
                                   logs every run (note in <inbox>/runs, #do #log)
   mem browser [site]              open mem's Chrome to log in to sites mem do should use
   mem extension                   set up the Chrome extension: save pages/selections, search, ask

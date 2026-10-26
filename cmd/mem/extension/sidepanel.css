@@ -1,0 +1,20 @@
+body { width: auto; }
+.h { font-weight: 700; margin-bottom: 6px; }
+.hint { color: var(--muted); font-size: 11px; }
+#conn { padding: 0 12px; color: #d9534f; font-size: 12px; }
+.run { margin: 0 12px 12px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; }
+.run .task { font-weight: 600; }
+.run .state { font-size: 11px; color: var(--muted); margin: 2px 0 6px; }
+.steps { list-style: none; padding: 0; margin: 0; font-size: 12px; color: var(--muted); max-height: 220px; overflow-y: auto; }
+.steps li { padding: 1px 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.card { margin-top: 8px; padding: 10px; border-radius: 8px; border: 1px solid var(--warn); }
+.card .what { font-weight: 600; }
+.card .url { font-size: 11px; color: var(--muted); word-break: break-all; margin: 2px 0 6px; }
+.card .fields { font-size: 12px; white-space: pre-wrap; border-left: 2px solid var(--line); padding-left: 8px; margin-bottom: 8px; }
+.card .btns { display: flex; gap: 6px; flex-wrap: wrap; }
+.card input { flex: 1; min-width: 120px; border: 1px solid var(--line); background: var(--field); color: var(--fg); border-radius: 6px; padding: 5px 8px; font: inherit; }
+button.secondary { background: var(--field); color: var(--fg); border: 1px solid var(--line); }
+.summary { margin-top: 8px; white-space: pre-wrap; }
+.summary.ok { border-left: 3px solid #22a06b; padding-left: 8px; }
+.summary.fail { border-left: 3px solid #d9534f; padding-left: 8px; }
+.note { font-size: 11px; color: var(--muted); margin-top: 4px; }

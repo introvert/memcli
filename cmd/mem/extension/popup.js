@@ -2,7 +2,7 @@
 // One mem process per popup, through native messaging; same requests as `mem serve`.
 const $ = (id) => document.getElementById(id);
 const handlers = new Map();
-let nextId = 1, ready, page = { title: '', url: '' };
+let nextId = 1, ready, page = { title: '', url: '' }, windowId;
 
 const port = chrome.runtime.connectNative('com.introvert.mem');
 const readyP = new Promise((r) => (ready = r));
@@ -31,6 +31,7 @@ function status(text, kind = '') { $('status').textContent = text || ''; $('stat
 
 async function init() {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  windowId = tab ? tab.windowId : (await chrome.windows.getCurrent()).id;
   if (tab && /^https?:/.test(tab.url)) {
     page = { title: tab.title, url: tab.url };
     $('pageTitle').textContent = tab.title || tab.url;
@@ -69,13 +70,15 @@ $('q').addEventListener('input', () => {
   clearTimeout(timer);
   const q = $('q').value;
   if (q.startsWith('?')) { $('results').innerHTML = ''; status('↩ to ask'); return; }
+  if (q.startsWith('!')) { $('results').innerHTML = ''; status('↩ to let mem do it in a new tab (opens the side panel)'); return; }
   status('');
   timer = setTimeout(() => search(q), 80);
 });
 $('q').addEventListener('keydown', (e) => {
   if (e.key !== 'Enter') return;
   const q = $('q').value.trim();
-  if (q.startsWith('?') && q.length > 1) ask(q.slice(1).trim());
+  if (q.startsWith('!') && q.length > 1) doTask(q.slice(1).trim());
+  else if (q.startsWith('?') && q.length > 1) ask(q.slice(1).trim());
   else if (q && (e.metaKey || e.ctrlKey)) ask(q);
 });
 
@@ -109,6 +112,14 @@ async function search(q) {
     else if (m.corrected) status('Showing close matches');
   });
   searchId = id;
+}
+
+// doTask hands the task to the background (which runs it) and opens the side panel to follow it.
+// sidePanel.open must be called right in the key handler (it needs the user gesture): no awaits first.
+function doTask(task) {
+  chrome.sidePanel.open({ windowId }).catch(() => {});
+  chrome.runtime.sendMessage({ type: 'start', task });
+  setTimeout(() => window.close(), 150);
 }
 
 function ask(q) {

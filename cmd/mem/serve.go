@@ -24,7 +24,7 @@ import (
 
 type request struct {
 	ID     int    `json:"id"`
-	Op     string `json:"op"` // search, add, ask, cancel, reset, item, copy_note, copy_text
+	Op     string `json:"op"` // search, add, ask, cancel, reset, item, copy_note, copy_text; extension: bridge, do, cdp_result, do_reply
 	Q      string `json:"q,omitempty"`
 	Text   string `json:"text,omitempty"`
 	Deep   bool   `json:"deep,omitempty"`
@@ -32,6 +32,10 @@ type request struct {
 	N      int    `json:"n,omitempty"`
 	Action string `json:"action,omitempty"` // item: copy | run
 	Limit  int    `json:"limit,omitempty"`
+	// replies from the extension: n is the cid of the event answered
+	Result json.RawMessage `json:"result,omitempty"`
+	Error  string          `json:"error,omitempty"`
+	OK     bool            `json:"ok,omitempty"`
 }
 
 type event map[string]any
@@ -58,7 +62,9 @@ type server struct {
 	write    func([]byte) // one encoded event to the client
 	wmu      sync.Mutex   // serializes writes
 	allowRun bool         // whether "item run" may run commands (not for the browser extension)
-	imu      sync.Mutex   // serializes index syncs
+	bmu      sync.Mutex
+	br       *bridge    // the extension's browser relay (native host only)
+	imu      sync.Mutex // serializes index syncs
 
 	run    sync.Mutex // one ask at a time
 	amu    sync.Mutex // guards the fields below
@@ -147,6 +153,13 @@ func (s *server) handle(r request) {
 		s.item(r)
 	case "copy_note":
 		s.copyNote(r)
+	case "bridge": // the extension's background: relay browser commands, serve `mem do` in terminals
+		go s.serveSocket()
+		s.send(r.ID, event{"ev": "ok"})
+	case "do":
+		s.doInBrowser(r)
+	case "cdp_result", "do_reply":
+		s.bridge().reply(r)
 	case "copy_text":
 		s.report(r.ID, copyText(r.Text, false), "copied")
 	default:

@@ -12,7 +12,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/chromedp/cdproto/target"
 	"github.com/chromedp/chromedp"
 )
 
@@ -107,7 +106,22 @@ func cmdBrowser(args []string) {
 	fmt.Println(c("2", "Log in to the sites you want `mem do` to use; sessions are kept in this profile."))
 }
 
+// cdpCaller sends one DevTools command to the agent's tab and returns the raw result. Two kinds:
+// mem's own Chrome over a websocket (openBrowser), or your everyday Chrome through the extension,
+// which relays commands to a tab it opens for the agent (extBrowser in extbridge.go).
+type cdpCaller interface {
+	call(method string, params map[string]any) (json.RawMessage, error)
+	close()
+}
+
+// browser does page-level actions on top of raw DevTools commands, so both kinds behave the same.
 type browser struct {
+	cdp cdpCaller
+}
+
+// ---------- mem's own Chrome ----------
+
+type chromedpCaller struct {
 	ctx    context.Context
 	cancel func()
 }
@@ -124,15 +138,55 @@ func openBrowser() (*browser, error) {
 		acancel()
 		return nil, fmt.Errorf("connecting to Chrome: %v", err)
 	}
-	return &browser{ctx: ctx, cancel: func() { cancel(); acancel() }}, nil
+	return &browser{cdp: &chromedpCaller{ctx, func() { cancel(); acancel() }}}, nil
 }
 
-func (b *browser) close() { b.cancel() }
-
-func (b *browser) run(timeout time.Duration, actions ...chromedp.Action) error {
-	ctx, cancel := context.WithTimeout(b.ctx, timeout)
+func (c *chromedpCaller) call(method string, params map[string]any) (json.RawMessage, error) {
+	ctx, cancel := context.WithTimeout(c.ctx, 30*time.Second)
 	defer cancel()
-	return chromedp.Run(ctx, actions...)
+	var res map[string]any
+	err := chromedp.Run(ctx, chromedp.ActionFunc(func(ctx context.Context) error {
+		return chromedp.FromContext(ctx).Target.Execute(ctx, method, params, &res)
+	}))
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(res)
+}
+
+func (c *chromedpCaller) close() { c.cancel() }
+
+// ---------- page actions ----------
+
+func (b *browser) close() { b.cdp.close() }
+
+// eval runs JavaScript in the page and decodes its (JSON-able) value into out.
+func (b *browser) eval(js string, out any) error {
+	raw, err := b.cdp.call("Runtime.evaluate", map[string]any{"expression": js, "returnByValue": true, "awaitPromise": true})
+	if err != nil {
+		return err
+	}
+	var r struct {
+		Result struct {
+			Value json.RawMessage `json:"value"`
+		} `json:"result"`
+		Exception *struct {
+			Text      string `json:"text"`
+			Exception struct {
+				Description string `json:"description"`
+			} `json:"exception"`
+		} `json:"exceptionDetails"`
+	}
+	if err := json.Unmarshal(raw, &r); err != nil {
+		return err
+	}
+	if r.Exception != nil {
+		return fmt.Errorf("page script failed: %s %s", r.Exception.Text, clip(r.Exception.Exception.Description, 200))
+	}
+	if out == nil || len(r.Result.Value) == 0 {
+		return nil
+	}
+	return json.Unmarshal(r.Result.Value, out)
 }
 
 // settle waits for the page to finish loading after an action (bounded, never fails).
@@ -140,13 +194,152 @@ func (b *browser) settle() {
 	time.Sleep(400 * time.Millisecond)
 	for i := 0; i < 20; i++ {
 		var state string
-		if b.run(2*time.Second, chromedp.Evaluate(`document.readyState`, &state)) == nil && state == "complete" {
+		if b.eval(`document.readyState`, &state) == nil && state == "complete" {
 			break
 		}
 		time.Sleep(250 * time.Millisecond)
 	}
 	time.Sleep(300 * time.Millisecond)
 }
+
+func (b *browser) snapshot() (pageState, error) {
+	var st pageState
+	err := b.eval(snapshotJS, &st)
+	return st, err
+}
+
+func (b *browser) element(n int) (elementInfo, error) {
+	var info elementInfo
+	err := b.eval(fmt.Sprintf("%s(%d)", elementInfoJS, n), &info)
+	return info, err
+}
+
+func (b *browser) url() string {
+	var u string
+	b.eval(`location.href`, &u)
+	return u
+}
+
+func memSel(n int) string { return fmt.Sprintf(`[data-mem="%d"]`, n) }
+
+func (b *browser) open(u string) error {
+	if !strings.Contains(u, "://") {
+		u = "https://" + u
+	}
+	raw, err := b.cdp.call("Page.navigate", map[string]any{"url": u})
+	if err != nil {
+		return err
+	}
+	var r struct {
+		ErrorText string `json:"errorText"`
+	}
+	json.Unmarshal(raw, &r)
+	if r.ErrorText != "" {
+		return fmt.Errorf("%s", r.ErrorText)
+	}
+	return nil
+}
+
+// click scrolls element n into view and clicks its center with real mouse events.
+func (b *browser) click(n int) error {
+	var pt struct {
+		Found bool
+		X, Y  float64
+	}
+	// Links that would open a new tab open in this one, so the agent keeps seeing them.
+	js := fmt.Sprintf(`(() => { const e = document.querySelector('%s'); if (!e) return {Found: false};
+	  e.removeAttribute('target'); e.scrollIntoView({block: 'center', inline: 'center'});
+	  const r = e.getBoundingClientRect(); return {Found: true, X: r.left + r.width / 2, Y: r.top + r.height / 2}; })()`, memSel(n))
+	if err := b.eval(js, &pt); err != nil {
+		return err
+	}
+	if !pt.Found {
+		return fmt.Errorf("element [%d] is gone; use the latest page", n)
+	}
+	for _, typ := range []string{"mouseMoved", "mousePressed", "mouseReleased"} {
+		if _, err := b.cdp.call("Input.dispatchMouseEvent", map[string]any{
+			"type": typ, "x": pt.X, "y": pt.Y, "button": "left", "clickCount": 1,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// typeText replaces the text of an input, textarea or editable element, then types like a user.
+func (b *browser) typeText(n int, text string) error {
+	var ok bool
+	js := fmt.Sprintf(`(() => { const e = document.querySelector('%s'); if (!e) return false;
+	  e.scrollIntoView({block: 'center'}); e.focus();
+	  if (e.isContentEditable) { document.execCommand('selectAll'); document.execCommand('delete'); }
+	  else if ('value' in e) {
+	    const proto = e.tagName === 'TEXTAREA' ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+	    Object.getOwnPropertyDescriptor(proto, 'value').set.call(e, '');  // works with React too
+	    e.dispatchEvent(new Event('input', {bubbles: true}));
+	  }
+	  return true; })()`, memSel(n))
+	if err := b.eval(js, &ok); err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("element [%d] is gone; use the latest page", n)
+	}
+	_, err := b.cdp.call("Input.insertText", map[string]any{"text": text})
+	return err
+}
+
+func (b *browser) selectOption(n int, option string) error {
+	js := fmt.Sprintf(`(() => { const e = document.querySelector('%s'); if (!e) return 'no such element';
+	  const want = %q.toLowerCase(); const o = [...e.options].find(o => o.text.trim().toLowerCase() === want || o.value.toLowerCase() === want)
+	    || [...e.options].find(o => o.text.toLowerCase().includes(want));
+	  if (!o) return 'no option ' + %q;
+	  e.value = o.value; e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); return ''; })()`, memSel(n), option, option)
+	var msg string
+	if err := b.eval(js, &msg); err != nil {
+		return err
+	}
+	if msg != "" {
+		return fmt.Errorf("%s", msg)
+	}
+	return nil
+}
+
+var keys = map[string]struct {
+	key, code, text string
+	vk              int
+}{
+	"enter": {"Enter", "Enter", "\r", 13}, "tab": {"Tab", "Tab", "", 9}, "escape": {"Escape", "Escape", "", 27},
+	"backspace": {"Backspace", "Backspace", "", 8}, "arrowdown": {"ArrowDown", "ArrowDown", "", 40}, "arrowup": {"ArrowUp", "ArrowUp", "", 38},
+}
+
+func (b *browser) press(name string) error {
+	k, ok := keys[strings.ToLower(name)]
+	if !ok {
+		return fmt.Errorf("unknown key %q (enter, tab, escape, backspace, arrowdown, arrowup)", name)
+	}
+	down := map[string]any{"type": "rawKeyDown", "key": k.key, "code": k.code, "windowsVirtualKeyCode": k.vk}
+	if k.text != "" {
+		down = map[string]any{"type": "keyDown", "key": k.key, "code": k.code, "windowsVirtualKeyCode": k.vk, "text": k.text}
+	}
+	if _, err := b.cdp.call("Input.dispatchKeyEvent", down); err != nil {
+		return err
+	}
+	_, err := b.cdp.call("Input.dispatchKeyEvent", map[string]any{"type": "keyUp", "key": k.key, "code": k.code, "windowsVirtualKeyCode": k.vk})
+	return err
+}
+
+func (b *browser) scroll(down bool) error {
+	dir := "1"
+	if !down {
+		dir = "-1"
+	}
+	return b.eval(`window.scrollBy(0, `+dir+` * window.innerHeight * 0.8)`, nil)
+}
+
+func (b *browser) back() error { return b.eval(`history.back()`, nil) }
+
+// activate brings the agent's tab to the front so you can watch (or step in).
+func (b *browser) activate() { b.cdp.call("Page.bringToFront", nil) }
 
 type pageState struct {
 	URL   string `json:"url"`
@@ -199,12 +392,6 @@ const snapshotJS = `(() => {
   return {url: location.href, title: document.title, items: items.join('\n'), text: text.slice(0, 6000), more: n >= MAX};
 })()`
 
-func (b *browser) snapshot() (pageState, error) {
-	var st pageState
-	err := b.run(10*time.Second, chromedp.Evaluate(snapshotJS, &st))
-	return st, err
-}
-
 // elementInfo describes element n for confirmations: what it is and, for a form, what will be sent.
 type elementInfo struct {
 	Found  bool     `json:"found"`
@@ -233,87 +420,3 @@ const elementInfoJS = `((n) => {
   }
   return {found: true, risky: el.getAttribute('data-mem-risky') === '1', label, fields};
 })`
-
-func (b *browser) element(n int) (elementInfo, error) {
-	var info elementInfo
-	err := b.run(5*time.Second, chromedp.Evaluate(fmt.Sprintf("%s(%d)", elementInfoJS, n), &info))
-	return info, err
-}
-
-func (b *browser) url() string {
-	var u string
-	b.run(3*time.Second, chromedp.Location(&u))
-	return u
-}
-
-func memSel(n int) string { return fmt.Sprintf(`[data-mem="%d"]`, n) }
-
-func (b *browser) open(u string) error {
-	if !strings.Contains(u, "://") {
-		u = "https://" + u
-	}
-	return b.run(30*time.Second, chromedp.Navigate(u))
-}
-
-func (b *browser) click(n int) error {
-	sel := memSel(n)
-	// Links that would open a new tab open in this one, so the agent keeps seeing them.
-	b.run(3*time.Second, chromedp.Evaluate(fmt.Sprintf(`(() => { const e = document.querySelector('%s'); if (e) { e.removeAttribute('target'); e.scrollIntoView({block: 'center'}); } })()`, sel), nil))
-	return b.run(10*time.Second, chromedp.Click(sel, chromedp.ByQuery, chromedp.NodeVisible))
-}
-
-// typeText replaces an input's value (or a contenteditable's text) by typing like a user.
-func (b *browser) typeText(n int, text string) error {
-	sel := memSel(n)
-	clear := fmt.Sprintf(`(() => { const e = document.querySelector('%s'); if (!e) return; e.scrollIntoView({block: 'center'}); e.focus();
-	  if (e.isContentEditable) { document.execCommand('selectAll'); document.execCommand('delete'); }
-	  else if ('value' in e) { e.select && e.select(); } })()`, sel)
-	return b.run(20*time.Second,
-		chromedp.Evaluate(clear, nil),
-		chromedp.KeyEvent("\b"), // deletes the selection, through the page's own handlers
-		chromedp.SendKeys(sel, text, chromedp.ByQuery),
-	)
-}
-
-func (b *browser) selectOption(n int, option string) error {
-	js := fmt.Sprintf(`(() => { const e = document.querySelector('%s'); if (!e) return 'no such element';
-	  const want = %q.toLowerCase(); const o = [...e.options].find(o => o.text.trim().toLowerCase() === want || o.value.toLowerCase() === want)
-	    || [...e.options].find(o => o.text.toLowerCase().includes(want));
-	  if (!o) return 'no option ' + %q;
-	  e.value = o.value; e.dispatchEvent(new Event('input', {bubbles: true})); e.dispatchEvent(new Event('change', {bubbles: true})); return ''; })()`, memSel(n), option, option)
-	var msg string
-	if err := b.run(5*time.Second, chromedp.Evaluate(js, &msg)); err != nil {
-		return err
-	}
-	if msg != "" {
-		return fmt.Errorf("%s", msg)
-	}
-	return nil
-}
-
-var keyNames = map[string]string{"enter": "\r", "tab": "\t", "escape": "\x1b", "backspace": "\b", "arrowdown": "\ue015", "arrowup": "\ue013"}
-
-func (b *browser) press(key string) error {
-	k, ok := keyNames[strings.ToLower(key)]
-	if !ok {
-		return fmt.Errorf("unknown key %q (enter, tab, escape, backspace, arrowdown, arrowup)", key)
-	}
-	return b.run(5*time.Second, chromedp.KeyEvent(k))
-}
-
-func (b *browser) scroll(down bool) error {
-	dir := "1"
-	if !down {
-		dir = "-1"
-	}
-	return b.run(5*time.Second, chromedp.Evaluate(`window.scrollBy(0, `+dir+` * window.innerHeight * 0.8)`, nil))
-}
-
-func (b *browser) back() error { return b.run(15*time.Second, chromedp.NavigateBack()) }
-
-// activate brings the agent's tab to the front so you can watch (or step in).
-func (b *browser) activate() {
-	if t := chromedp.FromContext(b.ctx).Target; t != nil {
-		b.run(3*time.Second, target.ActivateTarget(t.TargetID))
-	}
-}

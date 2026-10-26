@@ -198,25 +198,26 @@ mem extension      # registers mem with Chrome/Brave/Edge/Arc, then: chrome://ex
 ```
 
 - **⌥⇧M** (or the toolbar icon): write a note — the selected text is quoted in, the page link added — and
-  `⌘↩` saves it. Below: search your notes, or `?question` to ask the AI.
+  `⌘↩` saves it. Below: search your notes, `?question` to ask the AI, `!task` to let mem do it.
 - **Right-click → Save selection / link / page to mem** saves in one click (tagged `#web`).
 - It talks to the `mem` on your machine through Chrome's native messaging: no server, no port, nothing
-  leaves your computer except AI questions. Only this extension may start `mem`, and it can't run commands.
+  leaves your computer except AI questions. Only this extension may start `mem`, and it can't run shell
+  commands. It does need the *debugger* permission, which `mem do` uses to work in its own tab.
 
 ## Doing things on the web: `mem do`
 
-```sh
-mem browser                       # once: opens mem's Chrome; log in to sites you want it to use
-mem do "contact rainproxy about a large-scale plan"
-```
+From Chrome: **⌥⇧M → `!contact rainproxy about a large-scale plan`** (or the side panel's *Do a task*).
+From a terminal: `mem do "contact rainproxy about a large-scale plan"`.
 
-An agent drives a visible Chrome window: it finds the site, the contact or pricing page, fills
-in forms and writes the message, taking facts about you (name, email, company, earlier contact)
-from your notes, or asking you when something is missing.
+An agent works in a new tab of your own Chrome (in a purple "mem" tab group), so it's already
+logged in where you are: it finds the site and the contact or pricing page, fills in forms and
+writes the message, taking facts about you (name, email, company, earlier contact) from your
+notes, or asking you when something is missing. Chrome shows "mem started debugging this
+browser" while it works; *Cancel* on that bar stops it.
 
 - **Nothing is sent without you.** Clicking anything that sends, submits, buys, deletes or signs up,
-  and pressing Enter in a form, stops and shows exactly what will go out: `y` sends, `n` stops,
-  `e` stops and tells the agent why.
+  and pressing Enter in a form, stops and shows exactly what will go out — in the side panel
+  (*Send* / *Don't send*, optionally with what to change) or in the terminal (`y` / `n` / `e`).
 - **Secrets stay local.** The model sees passwords only as `[REDACTED:…]`; the real value is typed
   into the page on your machine and masked in everything read back. Page text is redacted too.
 - **Web pages can't give it orders.** Page text is treated as data; the confirmation step is the
@@ -224,8 +225,10 @@ from your notes, or asking you when something is missing.
 - **Every run is logged.** Each step goes to `~/.mem/runs/<time>.jsonl`, and a summary note with what
   was sent lands in `<inbox>/runs/` tagged `#do #log`, so `mem ask "what did I send rainproxy?"` works.
 
-Chrome runs with its own profile in `~/.mem/chrome` (Chrome won't allow remote control of your
-everyday profile), so you log in there once. `MEM_CHROME` picks another Chromium browser.
+How it connects: the extension keeps one `mem` running (native messaging) that relays DevTools
+commands to the agent's tab via `chrome.debugger`; terminal runs reach it over `~/.mem/ext.sock`
+(only you can open it). Without the extension, or with `mem do --profile`, mem starts its own
+Chrome with a separate profile in `~/.mem/chrome` instead (log in there once with `mem browser`).
 
 ## macOS menu bar app
 

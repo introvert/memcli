@@ -2,12 +2,15 @@ package main
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -60,9 +63,18 @@ var doTools = append(append([]Tool{}, agentTools...),
 		obj(props{"summary": str("What was done, what was sent and where, follow-ups"), "success": boolean("Whether the task was done")}, "summary", "success")},
 )
 
+// doUI is how a run talks to the user: the terminal for `mem do`, the side panel in Chrome.
+type doUI interface {
+	progress(line string)
+	// confirm shows what is about to be sent and waits; why is the user's reason when they decline.
+	confirm(what, url string, fields []string) (ok bool, why string)
+	ask(question string) string
+}
+
 type doRun struct {
 	s       *session
 	b       *browser
+	ui      doUI
 	task    string
 	started time.Time
 	log     *os.File
@@ -73,45 +85,67 @@ type doRun struct {
 }
 
 func cmdDo(args []string) {
-	o := parseOpts(args)
+	o := parseOpts(args, "--profile")
 	task := strings.TrimSpace(strings.Join(o.pos, " "))
 	if task == "" {
-		die("usage: mem do TASK   e.g. mem do \"contact rainproxy about a large-scale plan\"")
+		die("usage: mem do TASK [--profile]   e.g. mem do \"contact rainproxy about a large-scale plan\"")
 	}
 	if !isTTY(os.Stdin) {
 		die("mem do needs a terminal: it asks before sending anything")
 	}
 	cfg := loadConfig()
-	spec := pick(o, cfg.Model)
 	db, err := openIndex()
 	check(err)
-	fmt.Fprintln(os.Stderr, c("2", "· starting Chrome (profile "+chromeProfile()+")"))
-	b, err := openBrowser()
-	check(err)
+	// Your own Chrome through the extension when it's running; else mem's own Chrome profile.
+	var b *browser
+	if !o.flags["--profile"] {
+		if b, err = dialExtension(); err == nil {
+			fmt.Fprintln(os.Stderr, c("2", "· using your Chrome (mem extension), in a new tab"))
+		} else if errors.Is(err, syscall.ECONNREFUSED) {
+			os.Remove(extSocket()) // left over from a browser that quit
+		} else if exists(extSocket()) {
+			warn("couldn't use your Chrome through the extension: %v", err)
+		}
+	}
+	if b == nil {
+		fmt.Fprintln(os.Stderr, c("2", "· starting mem's Chrome (profile "+chromeProfile()+"); tip: `mem extension` lets it use your own Chrome"))
+		b, err = openBrowser()
+		check(err)
+	}
 	defer b.close()
 	b.activate()
+	summary, _, note, logPath := runDo(db, cfg, pick(o, cfg.Model), task, b, termUI{})
+	fmt.Println()
+	fmt.Println(summary)
+	if note != "" {
+		fmt.Println(c("2", "logged to "+note+" (and "+logPath+")"))
+	}
+}
 
-	r := &doRun{s: newSession(db, cfg, spec, Normal, "", nil), b: b, task: task, started: time.Now(),
+// runDo runs one task to the end and logs it; it returns the report and the log note's id.
+func runDo(db *sql.DB, cfg Config, spec, task string, b *browser, ui doUI) (summary string, ok bool, note, logPath string) {
+	r := &doRun{s: newSession(db, cfg, spec, Normal, "", nil), b: b, ui: ui, task: task, started: time.Now(),
 		extra: compileExtra(cfg.RedactPatterns)}
-	check(os.MkdirAll(filepath.Join(home, "runs"), 0o700))
-	logPath := filepath.Join(home, "runs", r.started.Format("060102-150405")+".jsonl")
-	r.log, err = os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
-	check(err)
-	defer r.log.Close()
+	os.MkdirAll(filepath.Join(home, "runs"), 0o700)
+	logPath = filepath.Join(home, "runs", r.started.Format("060102-150405")+".jsonl")
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return "Could not start: " + err.Error(), false, "", ""
+	}
+	r.log = f
+	defer f.Close()
 	r.record(map[string]any{"event": "start", "task": task, "model": spec})
 
-	summary, ok, err := r.loop(spec)
+	summary, ok, err = r.loop(spec)
 	if err != nil {
 		summary, ok = "Stopped: "+err.Error(), false
 	}
 	r.record(map[string]any{"event": "finish", "summary": summary, "success": ok})
-	fmt.Println()
-	fmt.Println(summary)
-	if id, err := r.saveNote(summary, ok, logPath); err == nil {
-		fmt.Println(c("2", "logged to "+id+" (and "+logPath+")"))
-	} else {
+	note, err = r.saveNote(summary, ok, logPath)
+	if err != nil {
 		warn("could not save the log note: %v", err)
 	}
+	return summary, ok, note, logPath
 }
 
 func (r *doRun) loop(spec string) (string, bool, error) {
@@ -169,8 +203,7 @@ func (r *doRun) tool(call ToolCall) string {
 		return out
 	case "ask_user":
 		r.step("ask: "+a.Question, call)
-		fmt.Fprintf(os.Stderr, "\n%s %s\n", c("36", "?"), a.Question)
-		ans := readLine(c("36", "› "))
+		ans := r.ui.ask(a.Question)
 		r.record(map[string]any{"event": "answer", "text": ans})
 		if ans == "" {
 			return "The user gave no answer."
@@ -250,11 +283,39 @@ func (r *doRun) page(did string) string {
 	return out
 }
 
-// confirm shows what is about to be sent and waits for y. Without an answer it's a no.
+// confirm asks the user before something is sent; the decision is logged either way.
 func (r *doRun) confirm(what string, info elementInfo) (bool, string) {
 	url := r.b.url()
+	fields := r.maskAll(info.Fields)
+	ok, why := r.ui.confirm(what, url, fields)
+	if ok {
+		r.sent = append(r.sent, fmt.Sprintf("%s on %s", what, url))
+		for _, f := range fields {
+			r.sent = append(r.sent, "  "+f)
+		}
+		r.record(map[string]any{"event": "confirmed", "action": what, "url": url, "fields": fields})
+		return true, ""
+	}
+	r.record(map[string]any{"event": "declined", "action": what, "reason": why})
+	if why == "" {
+		why = "they said no; don't retry this, finish and report"
+	}
+	return false, why
+}
+
+// termUI: progress on stderr, questions and confirmations in the terminal.
+type termUI struct{}
+
+func (termUI) progress(line string) { fmt.Fprintln(os.Stderr, c("2", "· "+line)) }
+
+func (termUI) ask(q string) string {
+	fmt.Fprintf(os.Stderr, "\n%s %s\n", c("36", "?"), q)
+	return readLine(c("36", "› "))
+}
+
+func (termUI) confirm(what, url string, fields []string) (bool, string) {
 	fmt.Fprintf(os.Stderr, "\n%s %s\n  on %s\n", c("33", "⚠ about to"), what, url)
-	for _, f := range r.maskAll(info.Fields) {
+	for _, f := range fields {
 		fmt.Fprintln(os.Stderr, "  "+c("2", "│ ")+strings.ReplaceAll(clip(f, 600), "\n", "\n  "+c("2", "│ ")))
 	}
 	fmt.Fprintf(os.Stderr, "  %s send · %s no · %s no, and tell the agent why ", c("36", "y"), c("36", "n"), c("36", "e"))
@@ -262,19 +323,11 @@ func (r *doRun) confirm(what string, info elementInfo) (bool, string) {
 	fmt.Fprintln(os.Stderr)
 	switch k {
 	case 'y', 'Y':
-		r.sent = append(r.sent, fmt.Sprintf("%s on %s", what, url))
-		for _, f := range r.maskAll(info.Fields) {
-			r.sent = append(r.sent, "  "+f)
-		}
-		r.record(map[string]any{"event": "confirmed", "action": what, "url": url, "fields": r.maskAll(info.Fields)})
 		return true, ""
 	case 'e', 'E':
-		why := readLine(c("36", "why › "))
-		r.record(map[string]any{"event": "declined", "action": what, "reason": why})
-		return false, why
+		return false, readLine(c("36", "why › "))
 	}
-	r.record(map[string]any{"event": "declined", "action": what})
-	return false, "they said no; don't retry this, finish and report"
+	return false, ""
 }
 
 // remember notes the secrets behind the placeholders in typed text, to mask them from then on.
@@ -301,7 +354,7 @@ func (r *doRun) maskAll(fields []string) []string {
 // never filled-in secrets).
 func (r *doRun) step(line string, call ToolCall) {
 	line = clip(strings.ReplaceAll(line, "\n", " "), 160)
-	fmt.Fprintln(os.Stderr, c("2", "· "+line))
+	r.ui.progress(line)
 	r.steps = append(r.steps, time.Now().Format("15:04:05")+" "+line)
 	r.record(map[string]any{"event": "tool", "tool": call.Name, "args": json.RawMessage(orEmptyJSON(call.Args))})
 }
